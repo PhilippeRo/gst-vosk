@@ -1047,7 +1047,9 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
 
     /* We want to catch up when we are behind (500 milliseconds) but also try
      * to get a result now and again (every half second) at least.
-     * See reminder below to calculate number of bytes for a second. */
+     * Reminder : number of bytes per second = 16 bits * rate / 8 bits
+     * so 1/100 of a second = number of bytes / 100.
+     * It means 5 buffers approx. */
     if (diff_time > (GST_SECOND / 2)) {
       GST_INFO_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up (%lu)",
                        GST_TIME_ARGS(diff_time),
@@ -1057,14 +1059,6 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
         return;
 
       GST_INFO_OBJECT (vosk, "forcing result checking (consumed one second of data)");
-    }
-    /* Make sure it's not underfed either (50 milliseconds).
-     * Reminder : number of bytes / per seconds = 16 bits * rate / 8 bits
-     * so 1/100 of a second = number of bytes / 100.
-     * It means 5 buffers approx. */
-    else if (vosk->processed_size <= vosk->rate / 10) {
-      GST_DEBUG_OBJECT (vosk, "we haven't processed enough before trying to get a result");
-      return;
     }
 
     switch (result) {
