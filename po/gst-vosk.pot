@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: gst-vosk\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2022-01-18 11:47+0100\n"
+"POT-Creation-Date: 2022-08-01 12:20+0200\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -17,14 +17,18 @@ msgstr ""
 "Content-Type: text/plain; charset=CHARSET\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: src/gstvosk.c:103
+#: src/gstvosk.c:199
 msgid "Location (path) of the speech model."
 msgstr ""
 
-#: src/gstvosk.c:107
+#: src/gstvosk.c:203
 msgid "Number of alternative results returned."
 msgstr ""
 
-#: src/gstvosk.c:113
+#: src/gstvosk.c:207
+msgid "Force the recognizer to return final results."
+msgstr ""
+
+#: src/gstvosk.c:213
 msgid "Performs speech recognition using libvosk"
 msgstr ""
