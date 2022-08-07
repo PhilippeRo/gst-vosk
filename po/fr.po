@@ -1,0 +1,33 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the gst-vosk package.
+# Rouquier Philippe <bonfire-app@wanadoo.fr>.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: gst-vosk\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2022-08-01 19:58+0200\n"
+"PO-Revision-Date: 2022-08-01 12:20+0200\n"
+"Last-Translator: Rouquier Philippe <bonfire-app@wanadoo.fr>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: src/gstvosk.c:199
+msgid "Location (path) of the speech model."
+msgstr "Emplacement (chemin) du modle"
+
+#: src/gstvosk.c:203
+msgid "Number of alternative results returned."
+msgstr "Nombre de rsultats alternatifs  retourner"
+
+#: src/gstvosk.c:207
+msgid "Force the recognizer to return final results."
+msgstr "Forcer l'obtention de rsultats dfinitifs"
+
+#: src/gstvosk.c:213
+msgid "Performs speech recognition using libvosk"
+msgstr "Opre une reconnaissance vocale avec VOSK"
