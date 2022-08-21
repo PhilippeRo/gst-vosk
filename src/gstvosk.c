@@ -39,9 +39,6 @@ GST_DEBUG_CATEGORY_STATIC (gst_vosk_debug);
 #define GST_VOSK_LOCK(vosk) (g_mutex_lock(&vosk->RecMut))
 #define GST_VOSK_UNLOCK(vosk) (g_mutex_unlock(&vosk->RecMut))
 
-#define GST_VOSK_LOAD_LOCK(vosk) (g_mutex_lock(&vosk->LoadMut))
-#define GST_VOSK_LOAD_UNLOCK(vosk) (g_mutex_unlock(&vosk->LoadMut))
-
 enum
 {
   LAST_SIGNAL
@@ -468,7 +465,6 @@ gst_vosk_load_model_async (gpointer cancellable,
    * cancelled for one model while it was waiting to be loaded.
    * In this latter case, wait for it to notice it was cancelled and leave.
    */
-  GST_VOSK_LOAD_LOCK(vosk);
 
   /* Thread might have been cancelled while waiting, so check that */
   if (g_cancellable_is_cancelled (status)) {
@@ -505,7 +501,6 @@ gst_vosk_load_model_async (gpointer cancellable,
 
 end:
 
-  GST_VOSK_LOAD_UNLOCK(vosk);
   g_object_unref(status);
 }
 

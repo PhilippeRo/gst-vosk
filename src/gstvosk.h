@@ -62,8 +62,6 @@ struct _GstVosk
   guint64           processed_size;
   GQueue            buffer;
   GCancellable     *current_operation;
-
-  GMutex            LoadMut;
 };
 
 struct _GstVoskClass
