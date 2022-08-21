@@ -57,12 +57,61 @@ enum
 
 /*
  * gst-launch-1.0 -m pulsesrc ! queue2 max-size-time=0 max-size-buffers=0 \
- *                   max-size-bytes=4294967294 ! audioconvert ! audiorate ! \
- *                   audioresample ! audio/x-raw,format=S16LE,rate=44100, \
- *                   channels=1! vosk alternatives=0 speech-model=path/to/model \
+ *                   max-size-bytes=4294967294 ! audio/x-raw,format=S16LE,rate=44100, \
+ *                   channels=1 ! vosk alternatives=0 speech-model=path/to/model \
  *                   ! fakesink
 */
 
+/* BUG : protect from local formatting errors when fr_ prefix
+   Maybe there are other locales ?
+   Use uselocale () when we can as it is supposed to be safer since it sets
+   the locale only for the thread. */
+#if HAVE_USELOCALE
+
+#define PROTECT_FROM_LOCALE_BUG_START                         \
+  locale_t current_locale;                                    \
+  locale_t new_locale;                                        \
+  locale_t old_locale = NULL;                                 \
+                                                              \
+  current_locale = uselocale (NULL);                          \
+  old_locale = duplocale (current_locale);                    \
+  new_locale = newlocale (LC_NUMERIC_MASK, "C", old_locale);  \
+  if (new_locale)                                             \
+    uselocale (new_locale);
+
+#else
+
+#define PROTECT_FROM_LOCALE_BUG_START                         \
+  gchar *saved_locale = NULL;                                 \
+  const gchar *current_locale;                                \
+  current_locale = setlocale(LC_NUMERIC, NULL);               \
+  if (current_locale != NULL &&                               \
+      g_str_has_prefix (current_locale, "fr_") == TRUE) {     \
+    saved_locale = g_strdup (current_locale);                 \
+    setlocale (LC_NUMERIC, "C");                              \
+    GST_LOG_OBJECT (vosk, "Changed locale %s", saved_locale); \
+  }
+
+#endif
+
+#if HAVE_USELOCALE
+
+#define PROTECT_FROM_LOCALE_BUG_END                           \
+  if (old_locale) {                                           \
+    uselocale (current_locale);                               \
+    freelocale (new_locale);                                  \
+  }
+
+#else
+
+#define PROTECT_FROM_LOCALE_BUG_END                           \
+  if (saved_locale != NULL) {                                 \
+    setlocale (LC_NUMERIC, saved_locale);                     \
+    GST_LOG_OBJECT (vosk, "Reset locale %s", saved_locale);   \
+    g_free (saved_locale);                                    \
+  }
+
+#endif
 /* the capabilities of the inputs and outputs. */
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -108,10 +157,14 @@ gst_vosk_result (GstVosk *vosk);
 static void
 gst_vosk_partial_result (GstVosk *vosk);
 
+static void
+gst_vosk_load_model_async (gpointer cancellable,
+                           gpointer element);
+
 /* Note : audio rate is handled by the application with the use of caps */
 
 /*
- * Needs to be called with the lock.
+ * Needs to be called with GST_VOSK_LOCK lock.
  */
 static inline void
 gst_vosk_cancel_current_operation(GstVosk *vosk)
@@ -124,11 +177,12 @@ gst_vosk_cancel_current_operation(GstVosk *vosk)
   }
 }
 
+/*
+ * Needs to be called with GST_VOSK_LOCK lock unless finalizing
+ */
 static void
 gst_vosk_reset (GstVosk *vosk)
 {
-  GST_VOSK_LOCK (vosk);
-
   if (vosk->prev_partial)
     g_free (vosk->prev_partial);
 
@@ -137,7 +191,6 @@ gst_vosk_reset (GstVosk *vosk)
   gst_vosk_cancel_current_operation(vosk);
 
   g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
-  vosk->buffering = FALSE;
 
   if (vosk->recognizer)
     vosk_recognizer_free (vosk->recognizer);
@@ -150,8 +203,6 @@ gst_vosk_reset (GstVosk *vosk)
     vosk_model_free (vosk->model);
 
   vosk->model = NULL;
-
-  GST_VOSK_UNLOCK(vosk);
 }
 
 static void
@@ -163,6 +214,9 @@ gst_vosk_finalize (GObject *object)
     g_free (vosk->model_path);
 
   vosk->model_path = NULL;
+
+  g_thread_pool_free(vosk->thread_pool, TRUE, TRUE);
+  vosk->thread_pool=NULL;
 
   gst_vosk_reset(vosk);
 
@@ -247,9 +301,13 @@ gst_vosk_init (GstVosk * vosk)
   vosk->recognizer = NULL;
   vosk->model = NULL;
 
-  vosk->num_loading_threads=0;
-
   g_queue_init(&vosk->buffer);
+
+  vosk->thread_pool=g_thread_pool_new((GFunc) gst_vosk_load_model_async,
+                                      vosk,
+                                      1,
+                                      FALSE,
+                                      NULL);
 }
 
 static gint
@@ -282,7 +340,7 @@ gst_vosk_get_rate(GstVosk *vosk)
 }
 
 /*
- * MUST be called with LOCK held
+ * MUST be called with GST_VOSK_LOCK held
  */
 static VoskRecognizer *
 gst_vosk_recognizer_new (GstVosk *vosk,
@@ -295,7 +353,7 @@ gst_vosk_recognizer_new (GstVosk *vosk,
     rate = (gfloat) gst_vosk_get_rate(vosk);
 
   if (rate <= 0.0) {
-    GST_INFO_OBJECT (vosk, "rate == 0");
+    GST_INFO_OBJECT (vosk, "rate not set yet: no recognizer created.");
     return NULL;
   }
 
@@ -317,7 +375,7 @@ gst_vosk_recognizer_new (GstVosk *vosk,
 }
 
 /*
- * MUST be called with LOCK held.
+ * MUST be called with GST_VOSK_LOCK held.
  */
 static void
 gst_vosk_clean_current_model(GstVosk *vosk)
@@ -334,6 +392,8 @@ gst_vosk_clean_current_model(GstVosk *vosk)
   }
 
   vosk->rate=0.0;
+
+  gst_vosk_cancel_current_operation(vosk);
 }
 
 static gboolean
@@ -341,34 +401,30 @@ gst_vosk_load_model_real (GstVosk *vosk,
                           GCancellable *status)
 {
   gchar *model_path = NULL;
-  gboolean ret = TRUE;
+  gboolean ret = FALSE;
   VoskModel *model;
 
-  /* Ensure the path of the model will not get destroyed */
-  GST_VOSK_LOCK (vosk);
-  gst_vosk_clean_current_model(vosk);
+  /* Ensure the path of the model will not get destroyed during duplication */
+  GST_VOSK_LOCK(vosk);
   model_path = g_strdup (vosk->model_path);
+  GST_VOSK_UNLOCK(vosk);
 
   GST_INFO_OBJECT (vosk, "creating model %s.", model_path);
-
-  GST_VOSK_UNLOCK(vosk);
 
   /* This is why we do all this. Depending on the model size it can take a long
    * time before it returns. */
   model = vosk_model_new (model_path);
 
-  GST_VOSK_LOCK (vosk);
+  GST_VOSK_LOCK(vosk);
 
   if (model == NULL) {
     GST_ERROR_OBJECT(vosk, "could not create model %s.", model_path);
-    ret=FALSE;
     goto out;
   }
 
   if (g_cancellable_is_cancelled (status)) {
     GST_INFO_OBJECT (vosk, "model creation cancelled %s.", model_path);
     vosk_model_free (model);
-    ret=FALSE;
     goto out;
   }
 
@@ -386,66 +442,54 @@ gst_vosk_load_model_real (GstVosk *vosk,
   /* This is the only place where vosk->model can be set and only one thread
    * at a time can do it. */
   vosk->model = model;
-
   vosk->recognizer = gst_vosk_recognizer_new (vosk, model, 0.0);
-  if (vosk->recognizer == NULL)
-    GST_INFO_OBJECT (vosk, "rate not set yet: no recognizer created.");
+
+  g_object_unref(vosk->current_operation);
+  vosk->current_operation=NULL;
+
+  ret=TRUE;
 
 out:
 
   g_free (model_path);
-
-  vosk->num_loading_threads --;
-  if (vosk->num_loading_threads == 0)
-    vosk->buffering = FALSE;
-
-  GST_VOSK_UNLOCK (vosk);
-  return (ret == TRUE && (g_cancellable_is_cancelled(status) == FALSE));
+  GST_VOSK_UNLOCK(vosk);
+  return ret;
 }
 
 static void
-gst_vosk_load_model_async (GstElement *element,
-                           gpointer user_data)
+gst_vosk_load_model_async (gpointer cancellable,
+                           gpointer element)
 {
-  GCancellable *status = G_CANCELLABLE (user_data);
+  GCancellable *status = G_CANCELLABLE (cancellable);
   GstVosk *vosk = GST_VOSK (element);
   GstMessage *message;
 
   /* There can be only one model loading at a time. Even when loading has been
-   * cancelled for one model, wait for it to notice it was cancelled and leave.
+   * cancelled for one model while it was waiting to be loaded.
+   * In this latter case, wait for it to notice it was cancelled and leave.
    */
   GST_VOSK_LOAD_LOCK(vosk);
 
-  /* We might have been waiting so check that before starting */
+  /* Thread might have been cancelled while waiting, so check that */
   if (g_cancellable_is_cancelled (status)) {
-    GST_VOSK_LOAD_UNLOCK(vosk);
-    return;
+    GST_INFO_OBJECT (vosk, "model creation cancelled before even trying.");
+    goto end;
   }
 
   if (!gst_vosk_load_model_real (vosk, status)) {
-    /* If we failed or were cancelled, move back to READY state
-     * if vosk->model == NULL, unless there is another thread waiting to load
-     * a new model. */
+      /* NOTE: at this point vosk->model and model MUST be NULL since we fail */
 
-    GST_INFO_OBJECT (vosk, "creation failed or was cancelled");
+    /* If we failed or were cancelled, move back to READY state, unless there is
+     * another thread waiting to load a new model. */
+    if (g_thread_pool_unprocessed (vosk->thread_pool))
+        goto end;
 
-    GST_VOSK_LOCK (vosk);
+      GST_STATE_LOCK(GST_ELEMENT(vosk));
+      gst_element_abort_state (GST_ELEMENT(vosk));
+      GST_STATE_UNLOCK(GST_ELEMENT(vosk));
 
-    if (vosk->num_loading_threads == 0) {
-      /* vosk->model MUST be NULL since we fail */
-      GST_VOSK_UNLOCK (vosk);
-
-      GST_STATE_LOCK (element);
-      gst_element_abort_state (element);
-      GST_STATE_UNLOCK (element);
-
-      gst_element_set_state(element, GST_STATE_READY);
-    }
-    else
-      GST_VOSK_UNLOCK (vosk);
-
-    GST_VOSK_LOAD_UNLOCK(vosk);
-    return;
+      gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
+    goto end;
   }
 
   GST_STATE_LOCK (element);
@@ -459,47 +503,37 @@ gst_vosk_load_model_async (GstElement *element,
                                         GST_CLOCK_TIME_NONE);
   gst_element_post_message (element, message);
 
+end:
+
   GST_VOSK_LOAD_UNLOCK(vosk);
+  g_object_unref(status);
 }
 
 /*
- * MUST be called with LOCK held and vosk->model_path != NULL
+ * MUST be called with GST_VOSK_LOCK held
  */
 static GstStateChangeReturn
 gst_vosk_load_model (GstVosk *vosk)
 {
   GstMessage *message;
 
-  /* Note: case where vosk->model_path == NULL should be handled outside that
-   * function when we don't hold the lock and we can set the state */
-  if (vosk->model_path == NULL) {
-    GST_ERROR_OBJECT (vosk, "model path is NULL.");
-    return GST_STATE_CHANGE_FAILURE;
-  }
+  /* Note: the function is called with vosk->model_path != NULL and
+   * vosk->model == NULL */
 
-  GST_DEBUG_OBJECT (vosk, "num loading threads %i", vosk->num_loading_threads);
+  GST_DEBUG_OBJECT (vosk, "num loading threads %i", g_thread_pool_unprocessed (vosk->thread_pool));
 
-  if (vosk->num_loading_threads == 2) {
-    /* Only allow two threads max, at most one running (to be cancelled) and
-     * the other one waiting. When the one waiting will wake up, it will pick
-     * the new model path.*/
-    GST_DEBUG_OBJECT (vosk, "not creating a new thread, waiting one will take care of loading new path");
-    return GST_STATE_CHANGE_SUCCESS;
-  }
-
-  /* Start buffering */
-  vosk->buffering = TRUE;
-  vosk->num_loading_threads ++;
-
-  /* Cancel ongoing operation if any and start a new one */
-  gst_vosk_cancel_current_operation (vosk);
+  /* Start a new model loading process */
   vosk->current_operation = g_cancellable_new();
+  g_thread_pool_push(vosk->thread_pool,
+                     g_object_ref (vosk->current_operation),
+                     NULL);
 
-  gst_element_call_async (GST_ELEMENT(vosk),
-                          gst_vosk_load_model_async,
-                          g_object_ref (vosk->current_operation),
-                          g_object_unref);
-
+  /* FIXME: try skipping the async message and return success
+   * so that we are passed the buffers while we load.
+   * Benefits: get rid of queue element, there might be some performance gains
+   * and there would be consistency since when we are PLAYING and loading a new
+   * model, then we don't tell the pipeline about it and keep receiving buffers.
+   */
   message = gst_message_new_async_start (GST_OBJECT_CAST (vosk));
   gst_element_post_message (GST_ELEMENT (vosk), message);
   return GST_STATE_CHANGE_ASYNC;
@@ -525,7 +559,7 @@ gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
 }
 
 /*
- * MUST be called with LOCK held
+ * MUST be called with GST_VOSK_LOCK held
  */
 static const gchar *
 gst_vosk_final_result (GstVosk *vosk)
@@ -534,34 +568,7 @@ gst_vosk_final_result (GstVosk *vosk)
 
   GST_INFO_OBJECT(vosk, "getting final result");
 
-#if HAVE_USELOCALE
-  // BUG : protect from local formatting errors when fr_ prefix
-  // Maybe there are other locales ?
-  // Use uselocale () when we can as it is supposed to be safer since it sets
-  // the locale only for the thread.
-
-  locale_t current_locale;
-	locale_t new_locale;
-	locale_t old_locale = NULL;
-
-  current_locale = uselocale (NULL);
-  old_locale = duplocale (current_locale);
-  new_locale = newlocale (LC_NUMERIC_MASK, "C", old_locale);
-  if (new_locale)
-    uselocale (new_locale);
-
-#else
-  gchar *saved_locale = NULL;
-  const gchar *current_locale;
-
-  current_locale = setlocale(LC_NUMERIC, NULL);
-  if (current_locale != NULL &&
-      g_str_has_prefix (current_locale, "fr_") == TRUE) {
-    saved_locale = g_strdup (current_locale);
-    setlocale (LC_NUMERIC, "C");
-    GST_LOG_OBJECT (vosk, "Changed locale %s", saved_locale);
-  }
-#endif
+  PROTECT_FROM_LOCALE_BUG_START
 
   if (G_UNLIKELY(vosk->recognizer == NULL)) {
     GST_DEBUG_OBJECT(vosk, "no recognizer available");
@@ -582,24 +589,11 @@ gst_vosk_final_result (GstVosk *vosk)
   }
 
   json_txt = vosk_recognizer_final_result (vosk->recognizer);
-
   vosk->processed_size = 0;
 
 end:
 
-  #if HAVE_USELOCALE
-  if (old_locale) {
-    uselocale (current_locale);
-    freelocale (new_locale);
-  }
-
-#else
-  if (saved_locale != NULL) {
-    setlocale (LC_NUMERIC, saved_locale);
-    GST_LOG_OBJECT (vosk, "Reset locale %s", saved_locale);
-    g_free (saved_locale);
-  }
-#endif
+  PROTECT_FROM_LOCALE_BUG_END
 
   GST_INFO_OBJECT(vosk, "final results");
 
@@ -609,9 +603,7 @@ end:
   return NULL;
 }
 
-/*
- * Call with VOSK lock held
- */
+/* Call with GST_VOSK_LOCK held */
 static GstStateChangeReturn
 gst_vosk_check_model_state(GstElement *element)
 {
@@ -621,7 +613,8 @@ gst_vosk_check_model_state(GstElement *element)
   if (vosk->model_path == NULL)
     return GST_STATE_CHANGE_FAILURE;
 
-  if (!vosk->model)
+  /* Only try to load a model if there isn't one and if none is being loaded */
+  if (!vosk->model && !vosk->current_operation)
     ret = gst_vosk_load_model (vosk);
   else
     ret = GST_STATE_CHANGE_SUCCESS;
@@ -639,9 +632,9 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
     case GST_STATE_CHANGE_PAUSED_TO_PAUSED:
-      GST_VOSK_LOCK (vosk);
+      GST_VOSK_LOCK(vosk);
       ret=gst_vosk_check_model_state(element);
-      GST_VOSK_UNLOCK (vosk);
+      GST_VOSK_UNLOCK(vosk);
 
       if (ret == GST_STATE_CHANGE_FAILURE)
         return GST_STATE_CHANGE_FAILURE;
@@ -658,7 +651,9 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
     case GST_STATE_CHANGE_READY_TO_NULL:
     case GST_STATE_CHANGE_READY_TO_READY:
     case GST_STATE_CHANGE_PAUSED_TO_READY:
+      GST_VOSK_LOCK(vosk);
       gst_vosk_reset (vosk);
+      GST_VOSK_UNLOCK(vosk);
       break;
 
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
@@ -683,7 +678,7 @@ gst_vosk_set_property (GObject * object, guint prop_id,
 
       model_path = g_value_get_string (value);
 
-      GST_DEBUG_OBJECT (vosk, "model change %s \n%i %i %i %i %i",
+      GST_DEBUG_OBJECT (vosk, "model change %s (state = %i %i %i %i %i)",
                         model_path,
                         GST_STATE(vosk),
                         GST_STATE_NEXT(vosk),
@@ -691,26 +686,23 @@ gst_vosk_set_property (GObject * object, guint prop_id,
                         GST_STATE_PENDING(vosk),
                         GST_STATE_RETURN(vosk));
 
-      GST_VOSK_LOCK (vosk);
-
-      if(!g_strcmp0 (model_path, vosk->model_path)) {
-        GST_VOSK_UNLOCK(vosk);
+      if(!g_strcmp0 (model_path, vosk->model_path))
         return;
-      }
+
+      GST_VOSK_LOCK(vosk);
 
       if (vosk->model_path)
         g_free (vosk->model_path);
 
       vosk->model_path = g_strdup (model_path);
 
-      if (vosk->model_path == NULL) {
-        gst_vosk_clean_current_model(vosk);
-        gst_vosk_cancel_current_operation(vosk);
+      /* This should start buffering if need be */
+      gst_vosk_clean_current_model(vosk);
 
-        /* Deal with the cases when we are supposed to be in a PAUSED or PLAYING
-         * states */
-        GST_VOSK_UNLOCK (vosk);
+      if (!model_path) {
+        GST_VOSK_UNLOCK(vosk);
 
+        /* Deal with the cases when we are in a PAUSED or PLAYING states */
         if (GST_STATE(vosk) >= GST_STATE_PAUSED ||
             GST_STATE_PENDING(vosk) >= GST_STATE_PAUSED)
           gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
@@ -728,14 +720,11 @@ gst_vosk_set_property (GObject * object, guint prop_id,
       if (vosk->model != NULL ||
           GST_STATE(vosk) >= GST_STATE_PAUSED ||
           GST_STATE_PENDING(vosk) >= GST_STATE_PAUSED) {
-        GST_DEBUG_OBJECT(vosk, "model is not NULL");
-
-        /* Should we tell that we are not available ?? gst_element_lost_state
-         * move to READY state ? */
         gst_vosk_load_model(vosk);
         GST_VOSK_UNLOCK(vosk);
 
-       return;
+        GST_DEBUG_OBJECT(vosk, "model is not NULL or state is PAUSED/PLAYING");
+        return;
       }
 
       GST_VOSK_UNLOCK(vosk);
@@ -771,10 +760,12 @@ gst_vosk_get_property (GObject *object,
     case PROP_SPEECH_MODEL:
       g_value_set_string (prop_value, vosk->model_path);
       break;
+
     case PROP_ALTERNATIVES:
       g_value_set_int(prop_value, vosk->alternatives);
       break;
 
+    /* FIXME: This should a function (+ GObject Introspection) */
     case PROP_RESULT:
       {
         const gchar *json_txt = NULL;
@@ -797,6 +788,7 @@ static gboolean
 gst_vosk_set_caps (GstVosk *vosk, GstCaps *caps)
 {
   GstStructure *caps_struct;
+  const gchar *json_txt;
   gboolean success;
   GstCaps *outcaps;
   gchar *caps_str;
@@ -806,46 +798,40 @@ gst_vosk_set_caps (GstVosk *vosk, GstCaps *caps)
   if (gst_structure_get_int (caps_struct, "rate", &rate) == FALSE)
     return FALSE;
 
-  GST_VOSK_LOCK (vosk);
-
   GST_INFO_OBJECT (vosk, "got rate %i", rate);
 
-  /* See that we have a model */
-  if (vosk->model) {
-    const gchar *json_txt;
+  GST_VOSK_LOCK(vosk);
 
-    /* We should have both at any moment */
-    if (vosk->recognizer != NULL) {
-      if ((gfloat) rate != vosk->rate) {
-        GST_INFO_OBJECT (vosk, "rate has changed; updating recognizer.");
-
-        /* Signal what we have recognized so far */
-        json_txt = gst_vosk_final_result (vosk);
-        gst_vosk_message_new (vosk, json_txt);
-
-        vosk_recognizer_free (vosk->recognizer);
-        vosk->recognizer = gst_vosk_recognizer_new (vosk, vosk->model, rate);
-        vosk->processed_size = 0;
-      }
-      else
-        GST_INFO_OBJECT (vosk, "rate has not changed; keeping current model and recognizer.");
+  if (vosk->recognizer) {
+    if (G_UNLIKELY((gfloat) rate == vosk->rate)) {
+      GST_INFO_OBJECT (vosk, "rate has not changed; keeping current recognizer.");
+      goto end;
     }
-    else {
-      GST_INFO_OBJECT (vosk, "no recognizer yet available to set rate ; creating one.");
-      vosk->recognizer = gst_vosk_recognizer_new (vosk, vosk->model, rate);
-      vosk->processed_size = 0;
-    }
+
+    GST_INFO_OBJECT (vosk, "rate has changed; updating recognizer.");
+
+    /* Send what we have recognized so far */
+    json_txt = gst_vosk_final_result (vosk);
+    gst_vosk_message_new (vosk, json_txt);
+
+    vosk_recognizer_free (vosk->recognizer);
   }
-  /* See if we are creating a model. If we don't have a model, we don't have a
-   * recognizer. */
-  else {
+  else if (!vosk->model) {
+    /* See if we are creating a model. */
     if (vosk->current_operation)
       GST_INFO_OBJECT (vosk, "model and recognizer are being created");
     else
       GST_INFO_OBJECT (vosk, "no model or recognizer ready to set rate yet");
-  }
 
-  GST_VOSK_UNLOCK (vosk);
+    goto end;
+  }
+  else
+    GST_INFO_OBJECT (vosk, "no recognizer yet available to set rate ; creating one.");
+
+  vosk->recognizer = gst_vosk_recognizer_new (vosk, vosk->model, rate);
+
+end:
+  GST_VOSK_UNLOCK(vosk);
 
   caps_str = g_strdup_printf ("audio/x-raw,"
                               "format=S16LE,"
@@ -866,7 +852,7 @@ gst_vosk_flush(GstVosk *vosk)
   GST_INFO_OBJECT (vosk, "flushing");
 
   /* Take the lock, empty queue and flush our recognizer */
-  GST_VOSK_LOCK (vosk);
+  GST_VOSK_LOCK(vosk);
 
   g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
   if (vosk->recognizer) {
@@ -885,12 +871,11 @@ gst_vosk_sink_event (GstPad *pad,
                      GstEvent * event)
 {
   GstVosk *vosk;
-  gboolean ret;
 
   vosk = GST_VOSK (parent);
 
-  GST_INFO_OBJECT (vosk, "Received %s event: %" GST_PTR_FORMAT,
-      GST_EVENT_TYPE_NAME (event), event);
+  GST_LOG_OBJECT (vosk, "Received %s event: %" GST_PTR_FORMAT,
+                  GST_EVENT_TYPE_NAME (event), event);
 
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_CAPS:
@@ -898,24 +883,11 @@ gst_vosk_sink_event (GstPad *pad,
       GstCaps *caps = NULL;
       GST_DEBUG_OBJECT (vosk, "caps event");
       gst_event_parse_caps (event, &caps);
-      ret = gst_vosk_set_caps (vosk, caps);
-      break;
+      return gst_vosk_set_caps (vosk, caps);
     }
 
-    case GST_EVENT_SEEK:
-      GST_DEBUG_OBJECT (vosk, "seek event");
-      ret = gst_pad_event_default (pad, parent, event);
-      break;
-
     case GST_EVENT_FLUSH_START:
-      GST_DEBUG_OBJECT (vosk, "flush start event");
       gst_vosk_flush(vosk);
-      ret = gst_pad_event_default (pad, parent, event);
-      break;
-
-    case GST_EVENT_FLUSH_STOP:
-      GST_DEBUG_OBJECT (vosk, "flush stop event");
-      ret = gst_pad_event_default (pad, parent, event);
       break;
 
     case GST_EVENT_EOS:
@@ -928,69 +900,30 @@ gst_vosk_sink_event (GstPad *pad,
       GST_VOSK_UNLOCK(vosk);
 
       GST_DEBUG_OBJECT (vosk, "EOS stop event");
-      ret = gst_pad_event_default (pad, parent, event);
       break;
     }
 
     default:
-      ret = gst_pad_event_default (pad, parent, event);
       break;
   }
-  return ret;
+
+  return gst_pad_event_default (pad, parent, event);
 }
 
 /*
- * Must be called with lock held
+ * The following functions are only called by gst_vosk_chain().
+ * Which means that GST_VOSK_LOCK is held.
  */
 static void
 gst_vosk_result (GstVosk *vosk)
 {
   const char *json_txt;
 
-#if HAVE_USELOCALE
-  // BUG : protect from local formatting errors when fr_ prefix
-  // Maybe there are other locales ?
-  // Use uselocale () when we can as it is supposed to be safer since it sets
-  // the locale only for the thread.
-
-  locale_t current_locale;
-	locale_t new_locale;
-	locale_t old_locale = NULL;
-
-  current_locale = uselocale (NULL);
-  old_locale = duplocale (current_locale);
-  new_locale = newlocale (LC_NUMERIC_MASK, "C", old_locale);
-  if (new_locale)
-    uselocale (new_locale);
-
-#else
-  gchar *saved_locale = NULL;
-  const gchar *current_locale;
-
-  current_locale = setlocale(LC_NUMERIC, NULL);
-  if (current_locale != NULL &&
-      g_str_has_prefix (current_locale, "fr_") == TRUE) {
-    saved_locale = g_strdup (current_locale);
-    setlocale (LC_NUMERIC, "C");
-    GST_LOG_OBJECT (vosk, "Changed locale %s", saved_locale);
-  }
-#endif
+  PROTECT_FROM_LOCALE_BUG_START
 
   json_txt = vosk_recognizer_result (vosk->recognizer);
 
-#if HAVE_USELOCALE
-  if (old_locale) {
-    uselocale (current_locale);
-    freelocale (new_locale);
-  }
-
-#else
-  if (saved_locale != NULL) {
-    setlocale (LC_NUMERIC, saved_locale);
-    GST_LOG_OBJECT (vosk, "Reset locale %s", saved_locale);
-    g_free (saved_locale);
-  }
-#endif
+  PROTECT_FROM_LOCALE_BUG_END
 
   if (vosk->prev_partial) {
     g_free (vosk->prev_partial);
@@ -1010,7 +943,7 @@ gst_vosk_partial_result (GstVosk *vosk)
   if (json_txt == NULL || g_strcmp0 (json_txt, "") == 0)
     return;
 
-  // To avoid posting message unnecessarily, make sure there is a change.
+  /* To avoid posting message unnecessarily, make sure there is a change. */
   if (g_strcmp0 (json_txt, vosk->prev_partial) == 0)
       return;
 
@@ -1023,66 +956,63 @@ gst_vosk_partial_result (GstVosk *vosk)
 static void
 gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
 {
+  GstClockTimeDiff diff_time;
   GstMapInfo info;
   gchar *data;
+  int result;
 
   gst_buffer_map(buf, &info, GST_MAP_READ);
   data = (gchar *)info.data;
 
-  if (info.size > 0) {
-    int result;
-    GstClockTimeDiff diff_time;
+  if (G_UNLIKELY(info.size == 0))
+    return;
 
-    diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS (buf), gst_element_get_current_running_time(GST_ELEMENT(vosk)));
-    GST_DEBUG_OBJECT (vosk, "buffer time=%"GST_TIME_FORMAT" current time=%"GST_TIME_FORMAT" diff=%li " \
-                      "(buffer size %lu)",
-                      GST_TIME_ARGS(GST_BUFFER_PTS (buf)),
-                      GST_TIME_ARGS(gst_element_get_current_running_time(GST_ELEMENT(vosk))),
-                      diff_time,
-                      info.size);
+  diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS (buf), gst_element_get_current_running_time(GST_ELEMENT(vosk)));
+  GST_LOG_OBJECT (vosk, "buffer time=%"GST_TIME_FORMAT" current time=%"GST_TIME_FORMAT" diff=%li " \
+                  "(buffer size %lu)",
+                  GST_TIME_ARGS(GST_BUFFER_PTS (buf)),
+                  GST_TIME_ARGS(gst_element_get_current_running_time(GST_ELEMENT(vosk))),
+                  diff_time,
+                  info.size);
 
-    result = vosk_recognizer_accept_waveform (vosk->recognizer, data, info.size);
+  result = vosk_recognizer_accept_waveform (vosk->recognizer, data, info.size);
 
-    vosk->processed_size += info.size;
+  vosk->processed_size += info.size;
 
-    /* We want to catch up when we are behind (500 milliseconds) but also try
-     * to get a result now and again (every half second) at least.
-     * Reminder : number of bytes per second = 16 bits * rate / 8 bits
-     * so 1/100 of a second = number of bytes / 100.
-     * It means 5 buffers approx. */
-    if (diff_time > (GST_SECOND / 2)) {
-      GST_INFO_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up (%lu)",
-                       GST_TIME_ARGS(diff_time),
-                       (vosk->processed_size % (guint64) vosk->rate));
+  /* We want to catch up when we are behind (500 milliseconds) but also try
+   * to get a result now and again (every half second) at least.
+   * Reminder : number of bytes per second = 16 bits * rate / 8 bits
+   * so 1/100 of a second = number of bytes / 100.
+   * It means 5 buffers approx. */
+  if (diff_time > (GST_SECOND / 2)) {
+    GST_INFO_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up (%lu)",
+                     GST_TIME_ARGS(diff_time),
+                     (vosk->processed_size % (guint64) vosk->rate));
 
-      if ((vosk->processed_size % (guint64) vosk->rate) >= info.size)
-        return;
+    if ((vosk->processed_size % (guint64) vosk->rate) >= info.size)
+      return;
 
-      GST_INFO_OBJECT (vosk, "forcing result checking (consumed one second of data)");
-    }
+    GST_INFO_OBJECT (vosk, "forcing result checking (consumed one second of data)");
+  }
 
-    switch (result) {
-      case 1 :
-        GST_DEBUG_OBJECT (vosk, "checking result");
-        gst_vosk_result(vosk);
-        break;
+  switch (result) {
+    case 1 :
+      GST_LOG_OBJECT (vosk, "checking result");
+      gst_vosk_result(vosk);
+      break;
 
-      case 0 :
-        GST_DEBUG_OBJECT (vosk, "checking partial result");
-        gst_vosk_partial_result(vosk);
-        break;
+    /* FIXME: check partial result not so often */
+    case 0 :
+      GST_LOG_OBJECT (vosk, "checking partial result");
+      gst_vosk_partial_result(vosk);
+      break;
 
-      default :
-        GST_ERROR_OBJECT (vosk, "accept_waveform error");
-        break;
-    }
+    default :
+      GST_ERROR_OBJECT (vosk, "accept_waveform error");
+      break;
   }
 }
 
-/*
- * MUST be called with LOCK held. The function will be releasing it from time
- * to time.
- */
 static void
 gst_vosk_chain_empty_buffer (GstVosk *vosk)
 {
@@ -1092,17 +1022,17 @@ gst_vosk_chain_empty_buffer (GstVosk *vosk)
   GST_DEBUG_OBJECT (vosk, "emptying queue buffer.");
 
   /* Try to catch up, feed it everything and only check if we were cancelled
-   * every two seconds worth of data (approx 200 buffers). It empties the queue.
-   * We do this with hold of the mutex otherwise the queue will fill while we
-   * empty it (see note below for a small exception to that). */
+   * every ten buffers. It empties the queue. */
 
   buf = g_queue_pop_head (&vosk->buffer);
   while (buf != NULL) {
     gst_vosk_handle_buffer(vosk, buf);
     gst_buffer_unref(buf);
 
-    if (num_buf++ > 10)
-      break;
+    if (num_buf++ > 10){
+      GST_DEBUG_OBJECT (vosk, "processed 10 buffers in the queue, there is more to process");
+      return;
+    }
 
     buf = g_queue_pop_head(&vosk->buffer);
   }
@@ -1110,6 +1040,7 @@ gst_vosk_chain_empty_buffer (GstVosk *vosk)
   GST_INFO_OBJECT (vosk, "processed all buffers in the queue");
 }
 
+/* Note: GstPad calls GST_VOSK_LOCK before it calls this function */
 static GstFlowReturn
 gst_vosk_chain (GstPad *sinkpad,
                 GstObject *parent,
@@ -1119,17 +1050,11 @@ gst_vosk_chain (GstPad *sinkpad,
 
   GST_LOG_OBJECT (vosk, "data received");
 
-  GST_VOSK_LOCK (vosk);
+  GST_VOSK_LOCK(vosk);
 
-  if (vosk->buffering == TRUE) {
-    GST_DEBUG_OBJECT (vosk, "buffering");
-
-    gst_buffer_ref(buf);
-    g_queue_push_tail(&vosk->buffer, buf);
-  }
-  else if (vosk->recognizer != NULL) {
-    /* Empty or buffer if it needs to */
-    if (g_queue_is_empty(&vosk->buffer) == FALSE) {
+  if (G_LIKELY(vosk->recognizer != NULL)) {
+    /* Empty our buffer if need be */
+    if (G_UNLIKELY(g_queue_is_empty(&vosk->buffer) == FALSE)) {
       gst_buffer_ref(buf);
       g_queue_push_tail(&vosk->buffer, buf);
 
@@ -1138,8 +1063,12 @@ gst_vosk_chain (GstPad *sinkpad,
     else
       gst_vosk_handle_buffer(vosk, buf);
   }
-  else
-    GST_WARNING_OBJECT (vosk, "buffer could not be handled");
+  else {
+    GST_LOG_OBJECT (vosk, "buffering");
+
+    gst_buffer_ref(buf);
+    g_queue_push_tail(&vosk->buffer, buf);
+  }
 
   GST_VOSK_UNLOCK(vosk);
 

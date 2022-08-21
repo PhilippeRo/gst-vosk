@@ -46,24 +46,24 @@ struct _GstVosk
   GstElement        element;
   GstPad           *sinkpad, *srcpad;
 
-  gchar            *model_path;
   gint              alternatives;
   gfloat            rate;
 
-  gchar            *prev_partial;
-
-  VoskModel        *model;
-  VoskRecognizer   *recognizer;
-
-  guint64           processed_size;
+  GThreadPool      *thread_pool;
 
   GMutex            RecMut;
-  GQueue            buffer;
-  gboolean          buffering;
 
+  /* Access to the following members should be done
+   * with GST_VOSK_LOCK held */
+  gchar            *model_path;
+  VoskModel        *model;
+  VoskRecognizer   *recognizer;
+  gchar            *prev_partial;
+  guint64           processed_size;
+  GQueue            buffer;
   GCancellable     *current_operation;
+
   GMutex            LoadMut;
-  guint             num_loading_threads;
 };
 
 struct _GstVoskClass
