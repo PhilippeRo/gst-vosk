@@ -109,6 +109,15 @@ enum
   }
 
 #endif
+
+#define GST_VOSK_LOADING_MODEL(vosk) (vosk->current_operation != NULL && \
+                                      g_cancellable_is_cancelled(vosk->current_operation) == FALSE)
+
+typedef struct {
+  gchar *model_path;
+  GCancellable *cancellable;
+} GstVoskThreadData;
+
 /* the capabilities of the inputs and outputs. */
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -160,9 +169,6 @@ gst_vosk_load_model_async (gpointer cancellable,
 
 /* Note : audio rate is handled by the application with the use of caps */
 
-/*
- * Needs to be called with GST_VOSK_LOCK lock.
- */
 static inline void
 gst_vosk_cancel_current_operation(GstVosk *vosk)
 {
@@ -174,32 +180,34 @@ gst_vosk_cancel_current_operation(GstVosk *vosk)
   }
 }
 
-/*
- * Needs to be called with GST_VOSK_LOCK lock unless finalizing
- */
 static void
 gst_vosk_reset (GstVosk *vosk)
 {
-  if (vosk->prev_partial)
-    g_free (vosk->prev_partial);
-
-  vosk->prev_partial = NULL;
-
   gst_vosk_cancel_current_operation(vosk);
+
+  GST_VOSK_LOCK(vosk);
 
   g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
 
-  if (vosk->recognizer)
+  if (vosk->recognizer) {
     vosk_recognizer_free (vosk->recognizer);
+    vosk->recognizer = NULL;
+    vosk->processed_size = 0;
+  }
 
-  vosk->recognizer = NULL;
-
-  vosk->processed_size = 0;
-
-  if (vosk->model != NULL)
+  if (vosk->model != NULL) {
     vosk_model_free (vosk->model);
+    vosk->model = NULL;
+  }
 
-  vosk->model = NULL;
+  if (vosk->prev_partial) {
+    g_free (vosk->prev_partial);
+    vosk->prev_partial = NULL;
+  }
+
+  GST_VOSK_UNLOCK(vosk);
+
+  vosk->rate=0.0;
 }
 
 static void
@@ -207,15 +215,15 @@ gst_vosk_finalize (GObject *object)
 {
   GstVosk *vosk = GST_VOSK (object);
 
-  if (vosk->model_path)
-    g_free (vosk->model_path);
+  gst_vosk_reset(vosk);
 
-  vosk->model_path = NULL;
+  if (vosk->model_path) {
+    g_free (vosk->model_path);
+    vosk->model_path = NULL;
+  }
 
   g_thread_pool_free(vosk->thread_pool, TRUE, TRUE);
   vosk->thread_pool=NULL;
-
-  gst_vosk_reset(vosk);
 
   GST_DEBUG_OBJECT (vosk, "finalizing.");
 }
@@ -337,7 +345,7 @@ gst_vosk_get_rate(GstVosk *vosk)
 }
 
 /*
- * MUST be called with GST_VOSK_LOCK held
+ * MUST be called with lock held
  */
 static VoskRecognizer *
 gst_vosk_recognizer_new (GstVosk *vosk,
@@ -371,40 +379,13 @@ gst_vosk_recognizer_new (GstVosk *vosk,
   return recognizer;
 }
 
-/*
- * MUST be called with GST_VOSK_LOCK held.
- */
-static void
-gst_vosk_clean_current_model(GstVosk *vosk)
-{
-  if (vosk->recognizer) {
-    vosk_recognizer_free (vosk->recognizer);
-    vosk->recognizer = NULL;
-    vosk->processed_size = 0;
-  }
-
-  if (vosk->model) {
-    vosk_model_free (vosk->model);
-    vosk->model = NULL;
-  }
-
-  vosk->rate=0.0;
-
-  gst_vosk_cancel_current_operation(vosk);
-}
-
 static gboolean
 gst_vosk_load_model_real (GstVosk *vosk,
+                          const gchar *model_path,
                           GCancellable *status)
 {
-  gchar *model_path = NULL;
   gboolean ret = FALSE;
   VoskModel *model;
-
-  /* Ensure the path of the model will not get destroyed during duplication */
-  GST_VOSK_LOCK(vosk);
-  model_path = g_strdup (vosk->model_path);
-  GST_VOSK_UNLOCK(vosk);
 
   GST_INFO_OBJECT (vosk, "creating model %s.", model_path);
 
@@ -441,25 +422,30 @@ gst_vosk_load_model_real (GstVosk *vosk,
   vosk->model = model;
   vosk->recognizer = gst_vosk_recognizer_new (vosk, model, 0.0);
 
-  g_object_unref(vosk->current_operation);
-  vosk->current_operation=NULL;
+  /* Note: leave vosk->current_operation alone. It goes stale and will remain
+   * till another call to load_model() or till the end of the plugin's life.
+   * But leaving like that avoids lock operation.
+   * Just mark it as cancelled see calling function. */
 
   ret=TRUE;
 
 out:
 
-  g_free (model_path);
   GST_VOSK_UNLOCK(vosk);
   return ret;
 }
 
 static void
-gst_vosk_load_model_async (gpointer cancellable,
+gst_vosk_load_model_async (gpointer thread_data,
                            gpointer element)
 {
-  GCancellable *status = G_CANCELLABLE (cancellable);
   GstVosk *vosk = GST_VOSK (element);
+  GCancellable *status;
   GstMessage *message;
+  gchar *model_path;
+
+  status = G_CANCELLABLE(((GstVoskThreadData *)thread_data)->cancellable);
+  model_path = g_strdup(((GstVoskThreadData *)thread_data)->model_path);
 
   /* There can be only one model loading at a time. Even when loading has been
    * cancelled for one model while it was waiting to be loaded.
@@ -472,7 +458,7 @@ gst_vosk_load_model_async (gpointer cancellable,
     goto end;
   }
 
-  if (!gst_vosk_load_model_real (vosk, status)) {
+  if (!gst_vosk_load_model_real (vosk, model_path, status)) {
       /* NOTE: at this point vosk->model and model MUST be NULL since we fail */
 
     /* If we failed or were cancelled, move back to READY state, unless there is
@@ -501,26 +487,34 @@ gst_vosk_load_model_async (gpointer cancellable,
 
 end:
 
+  g_cancellable_cancel(status);
   g_object_unref(status);
+  g_free(model_path);
+  g_free(thread_data);
 }
 
 /*
- * MUST be called with GST_VOSK_LOCK held
+ * NO NEED to call it with any lock held from main thread
  */
 static GstStateChangeReturn
 gst_vosk_load_model (GstVosk *vosk)
 {
   GstMessage *message;
+  GstVoskThreadData * thread_data;
 
   /* Note: the function is called with vosk->model_path != NULL and
-   * vosk->model == NULL */
+   * vosk->model == NULL and vosk->current_operation == NULL.
+   * That is the reason why we can call it without LOCK held. */
 
   GST_DEBUG_OBJECT (vosk, "num loading threads %i", g_thread_pool_unprocessed (vosk->thread_pool));
 
   /* Start a new model loading process */
   vosk->current_operation = g_cancellable_new();
+  thread_data=g_new0(GstVoskThreadData, 1);
+  thread_data->cancellable=g_object_ref(vosk->current_operation);
+  thread_data->model_path=g_strdup(vosk->model_path);
   g_thread_pool_push(vosk->thread_pool,
-                     g_object_ref (vosk->current_operation),
+                     thread_data,
                      NULL);
 
   /* FIXME: try skipping the async message and return success
@@ -554,7 +548,7 @@ gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
 }
 
 /*
- * MUST be called with GST_VOSK_LOCK held
+ * MUST be called with lock held
  */
 static const gchar *
 gst_vosk_final_result (GstVosk *vosk)
@@ -598,18 +592,17 @@ end:
   return NULL;
 }
 
-/* Call with GST_VOSK_LOCK held */
 static GstStateChangeReturn
 gst_vosk_check_model_state(GstElement *element)
 {
   GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
   GstVosk *vosk = GST_VOSK (element);
 
-  if (vosk->model_path == NULL)
+  if (!vosk->model_path)
     return GST_STATE_CHANGE_FAILURE;
 
   /* Only try to load a model if there isn't one and if none is being loaded */
-  if (!vosk->model && !vosk->current_operation)
+  if (!vosk->model && !GST_VOSK_LOADING_MODEL(vosk))
     ret = gst_vosk_load_model (vosk);
   else
     ret = GST_STATE_CHANGE_SUCCESS;
@@ -627,10 +620,7 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
     case GST_STATE_CHANGE_PAUSED_TO_PAUSED:
-      GST_VOSK_LOCK(vosk);
       ret=gst_vosk_check_model_state(element);
-      GST_VOSK_UNLOCK(vosk);
-
       if (ret == GST_STATE_CHANGE_FAILURE)
         return GST_STATE_CHANGE_FAILURE;
 
@@ -646,9 +636,7 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
     case GST_STATE_CHANGE_READY_TO_NULL:
     case GST_STATE_CHANGE_READY_TO_READY:
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      GST_VOSK_LOCK(vosk);
       gst_vosk_reset (vosk);
-      GST_VOSK_UNLOCK(vosk);
       break;
 
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
@@ -684,19 +672,14 @@ gst_vosk_set_property (GObject * object, guint prop_id,
       if(!g_strcmp0 (model_path, vosk->model_path))
         return;
 
-      GST_VOSK_LOCK(vosk);
-
       if (vosk->model_path)
         g_free (vosk->model_path);
 
       vosk->model_path = g_strdup (model_path);
 
-      /* This should start buffering if need be */
-      gst_vosk_clean_current_model(vosk);
+      gst_vosk_reset(vosk);
 
       if (!model_path) {
-        GST_VOSK_UNLOCK(vosk);
-
         /* Deal with the cases when we are in a PAUSED or PLAYING states */
         if (GST_STATE(vosk) >= GST_STATE_PAUSED ||
             GST_STATE_PENDING(vosk) >= GST_STATE_PAUSED)
@@ -706,25 +689,24 @@ gst_vosk_set_property (GObject * object, guint prop_id,
       }
 
       /* See if we need to update our model. Only load a model without changing
-       * state if we have one already of if state/state pending are at least
-       * paused.
-       * Note: we could have vosk->model == NULL and state pending == PAUSED
-       * if we are transitionning from READY and the model is being loaded.
-       * But in this case, the call to sync_state_with_parent will do the same
-       * as below (which means state == PAUSED or PLAYING). */
-      if (vosk->model != NULL ||
-          GST_STATE(vosk) >= GST_STATE_PAUSED ||
+       * state if state/state pending are at least paused.
+       * At this point, all loading has been cancelled and there is not model
+       * or recognizer loaded (see the call above). */
+      if (GST_STATE(vosk) >= GST_STATE_PAUSED ||
           GST_STATE_PENDING(vosk) >= GST_STATE_PAUSED) {
         gst_vosk_load_model(vosk);
-        GST_VOSK_UNLOCK(vosk);
-
-        GST_DEBUG_OBJECT(vosk, "model is not NULL or state is PAUSED/PLAYING");
+        GST_DEBUG_OBJECT(vosk, "state is PAUSED/PLAYING");
         return;
       }
 
-      GST_VOSK_UNLOCK(vosk);
-
-      GST_DEBUG_OBJECT(vosk, "sync with parent state after model change (from NULL)");
+      // FIXME: should we keep this?
+      /* Note: we could have vosk->model == NULL and state pending == PAUSED
+       * if we are transitionning from READY and the model is being loaded.
+       * But in this case, the call to sync_state_with_parent will do the same
+       * as below (which means state == PAUSED or PLAYING). */
+      /* This is for cases when we are in READY state and transitioning to
+       * PAUSED loading a model that was cancelled. */
+      GST_DEBUG_OBJECT(vosk, "sync with parent state after model changed");
       gst_element_sync_state_with_parent (GST_ELEMENT(vosk));
       break;
     }
@@ -907,7 +889,7 @@ gst_vosk_sink_event (GstPad *pad,
 
 /*
  * The following functions are only called by gst_vosk_chain().
- * Which means that GST_VOSK_LOCK is held.
+ * Which means that lock is held.
  */
 static void
 gst_vosk_result (GstVosk *vosk)
@@ -1035,7 +1017,6 @@ gst_vosk_chain_empty_buffer (GstVosk *vosk)
   GST_INFO_OBJECT (vosk, "processed all buffers in the queue");
 }
 
-/* Note: GstPad calls GST_VOSK_LOCK before it calls this function */
 static GstFlowReturn
 gst_vosk_chain (GstPad *sinkpad,
                 GstObject *parent,
