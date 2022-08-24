@@ -50,6 +50,9 @@ struct _GstVosk
   gint              alternatives;
   gfloat            rate;
 
+  GstClockTime      last_partial;
+  gint64            partial_time_interval;
+
   GCancellable     *current_operation;
   GThreadPool      *thread_pool;
 

@@ -50,6 +50,7 @@ enum
   PROP_SPEECH_MODEL,
   PROP_ALTERNATIVES,
   PROP_RESULT,
+  PROP_PARTIAL_RESULTS,
 };
 
 /*
@@ -58,6 +59,9 @@ enum
  *                   channels=1 ! vosk alternatives=0 speech-model=path/to/model \
  *                   ! fakesink
 */
+
+#define VOSK_EMPTY_PARTIAL_RESULT "{\n  \"partial\" : \"\"\n}"
+#define VOSK_EMPTY_TEXT_RESULT "{\n  \"text\" : \"\"\n}"
 
 /* BUG : protect from local formatting errors when fr_ prefix
    Maybe there are other locales ?
@@ -266,6 +270,10 @@ gst_vosk_class_init (GstVoskClass * klass)
       g_param_spec_string ("final-results", "Get recognizer's final results", _("Force the recognizer to return final results."),
           NULL, G_PARAM_READABLE));
 
+  g_object_class_install_property (gobject_class, PROP_PARTIAL_RESULTS,
+      g_param_spec_int64 ("partial-results", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results."),
+          -1,G_MAXINT64, 0, G_PARAM_READWRITE));
+
   gst_element_class_set_details_simple(gstelement_class,
     "vosk",
     "Filter/Audio",
@@ -393,6 +401,8 @@ gst_vosk_load_model_real (GstVosk *vosk,
    * time before it returns. */
   model = vosk_model_new (model_path);
 
+  GST_INFO_OBJECT (vosk, "model ready %s.", model_path);
+
   GST_VOSK_LOCK(vosk);
 
   if (model == NULL) {
@@ -406,7 +416,7 @@ gst_vosk_load_model_real (GstVosk *vosk,
     goto out;
   }
 
-  GST_INFO_OBJECT (vosk, "model created %s.", model_path);
+  GST_INFO_OBJECT (vosk, "model set %s.", model_path);
 
   /* That should not happen of there is an error in the code. Nothing but this
    * function should be able to create a model !! And again, one thread at a
@@ -699,11 +709,6 @@ gst_vosk_set_property (GObject * object, guint prop_id,
         return;
       }
 
-      // FIXME: should we keep this?
-      /* Note: we could have vosk->model == NULL and state pending == PAUSED
-       * if we are transitionning from READY and the model is being loaded.
-       * But in this case, the call to sync_state_with_parent will do the same
-       * as below (which means state == PAUSED or PLAYING). */
       /* This is for cases when we are in READY state and transitioning to
        * PAUSED loading a model that was cancelled. */
       GST_DEBUG_OBJECT(vosk, "sync with parent state after model changed");
@@ -717,6 +722,10 @@ gst_vosk_set_property (GObject * object, guint prop_id,
 
       vosk->alternatives = g_value_get_int(value);
       gst_vosk_set_num_alternatives (vosk);
+      break;
+
+    case PROP_PARTIAL_RESULTS:
+      vosk->partial_time_interval=g_value_get_int64(value) * GST_MSECOND;
       break;
 
     default:
@@ -753,6 +762,10 @@ gst_vosk_get_property (GObject *object,
         g_value_set_string (prop_value, json_txt);
         GST_VOSK_UNLOCK(vosk);
       }
+      break;
+
+    case PROP_PARTIAL_RESULTS:
+      g_value_set_int64(prop_value, vosk->partial_time_interval / GST_MSECOND);
       break;
 
     default:
@@ -907,6 +920,10 @@ gst_vosk_result (GstVosk *vosk)
     vosk->prev_partial = NULL;
   }
 
+  /* Don't send message if empty */
+  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
+    return;
+
   gst_vosk_message_new (vosk, json_txt);
   vosk->processed_size = 0;
 }
@@ -917,7 +934,7 @@ gst_vosk_partial_result (GstVosk *vosk)
   const char *json_txt;
 
   json_txt = vosk_recognizer_partial_result (vosk->recognizer);
-  if (json_txt == NULL || g_strcmp0 (json_txt, "") == 0)
+  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_PARTIAL_RESULT))
     return;
 
   /* To avoid posting message unnecessarily, make sure there is a change. */
@@ -934,25 +951,28 @@ static void
 gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
 {
   GstClockTimeDiff diff_time;
+  GstClockTime current_time;
   GstMapInfo info;
-  gchar *data;
   int result;
 
   gst_buffer_map(buf, &info, GST_MAP_READ);
-  data = (gchar *)info.data;
 
   if (G_UNLIKELY(info.size == 0))
     return;
 
-  diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS (buf), gst_element_get_current_running_time(GST_ELEMENT(vosk)));
+  current_time = gst_element_get_current_running_time(GST_ELEMENT(vosk));
+  diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS (buf), current_time);
+
   GST_LOG_OBJECT (vosk, "buffer time=%"GST_TIME_FORMAT" current time=%"GST_TIME_FORMAT" diff=%li " \
                   "(buffer size %lu)",
                   GST_TIME_ARGS(GST_BUFFER_PTS (buf)),
-                  GST_TIME_ARGS(gst_element_get_current_running_time(GST_ELEMENT(vosk))),
+                  GST_TIME_ARGS(current_time),
                   diff_time,
                   info.size);
 
-  result = vosk_recognizer_accept_waveform (vosk->recognizer, data, info.size);
+  result = vosk_recognizer_accept_waveform (vosk->recognizer,
+                                            (gchar*) info.data,
+                                            info.size);
 
   vosk->processed_size += info.size;
 
@@ -978,10 +998,14 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
       gst_vosk_result(vosk);
       break;
 
-    /* FIXME: check partial result not so often */
     case 0 :
-      GST_LOG_OBJECT (vosk, "checking partial result");
-      gst_vosk_partial_result(vosk);
+      diff_time=GST_CLOCK_DIFF(vosk->last_partial, GST_BUFFER_PTS (buf));
+      if (vosk->partial_time_interval >= 0 &&
+          vosk->partial_time_interval < diff_time) {
+        GST_LOG_OBJECT (vosk, "checking partial result");
+        gst_vosk_partial_result(vosk);
+        vosk->last_partial=current_time;
+      }
       break;
 
     default :
