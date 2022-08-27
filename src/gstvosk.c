@@ -60,8 +60,9 @@ enum
  *                   ! fakesink
 */
 
-#define VOSK_EMPTY_PARTIAL_RESULT "{\n  \"partial\" : \"\"\n}"
-#define VOSK_EMPTY_TEXT_RESULT "{\n  \"text\" : \"\"\n}"
+#define VOSK_EMPTY_PARTIAL_RESULT  "{\n  \"partial\" : \"\"\n}"
+#define VOSK_EMPTY_TEXT_RESULT     "{\n  \"text\" : \"\"\n}"
+#define VOSK_EMPTY_TEXT_RESULT_ALT "{\"text\": \"\"}"
 
 /* BUG : protect from local formatting errors when fr_ prefix
    Maybe there are other locales ?
@@ -933,8 +934,12 @@ gst_vosk_partial_result (GstVosk *vosk)
 {
   const char *json_txt;
 
+  /* NOTE: surprisingly this function can return "text" results. Mute them if
+   * empty. */
   json_txt = vosk_recognizer_partial_result (vosk->recognizer);
-  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_PARTIAL_RESULT))
+  if (!json_txt ||
+      !strcmp(json_txt, VOSK_EMPTY_PARTIAL_RESULT) ||
+      !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT_ALT))
     return;
 
   /* To avoid posting message unnecessarily, make sure there is a change. */
@@ -956,9 +961,17 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
   int result;
 
   gst_buffer_map(buf, &info, GST_MAP_READ);
-
   if (G_UNLIKELY(info.size == 0))
     return;
+
+  result = vosk_recognizer_accept_waveform (vosk->recognizer,
+                                            (gchar*) info.data,
+                                            info.size);
+  if (result == -1) {
+    GST_ERROR_OBJECT (vosk, "accept_waveform error");
+    return;
+  }
+  vosk->processed_size += info.size;
 
   current_time = gst_element_get_current_running_time(GST_ELEMENT(vosk));
   diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS (buf), current_time);
@@ -969,12 +982,6 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
                   GST_TIME_ARGS(current_time),
                   diff_time,
                   info.size);
-
-  result = vosk_recognizer_accept_waveform (vosk->recognizer,
-                                            (gchar*) info.data,
-                                            info.size);
-
-  vosk->processed_size += info.size;
 
   /* We want to catch up when we are behind (500 milliseconds) but also try
    * to get a result now and again (every half second) at least.
@@ -992,25 +999,20 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
     GST_INFO_OBJECT (vosk, "forcing result checking (consumed one second of data)");
   }
 
-  switch (result) {
-    case 1 :
-      GST_LOG_OBJECT (vosk, "checking result");
-      gst_vosk_result(vosk);
-      break;
+  if (result == 1) {
+    GST_LOG_OBJECT (vosk, "checking result");
+    gst_vosk_result(vosk);
+    return;
+  }
 
-    case 0 :
-      diff_time=GST_CLOCK_DIFF(vosk->last_partial, GST_BUFFER_PTS (buf));
-      if (vosk->partial_time_interval >= 0 &&
-          vosk->partial_time_interval < diff_time) {
-        GST_LOG_OBJECT (vosk, "checking partial result");
-        gst_vosk_partial_result(vosk);
-        vosk->last_partial=current_time;
-      }
-      break;
+  if (vosk->partial_time_interval < 0)
+    return;
 
-    default :
-      GST_ERROR_OBJECT (vosk, "accept_waveform error");
-      break;
+  diff_time=GST_CLOCK_DIFF(vosk->last_partial, GST_BUFFER_PTS (buf));
+  if (vosk->partial_time_interval < diff_time) {
+    GST_LOG_OBJECT (vosk, "checking partial result");
+    gst_vosk_partial_result(vosk);
+    vosk->last_partial=GST_BUFFER_PTS (buf);
   }
 }
 
