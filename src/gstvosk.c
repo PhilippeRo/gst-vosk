@@ -129,7 +129,7 @@ static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("audio/x-raw,"
                      "format=S16LE,"
-                     "rate={ 8000, 11250, 22500, 32000, 44100, 48000, 96000 },"
+                     "rate=[1, 2147483647],"
                      "channels=1")
     );
 
@@ -138,7 +138,7 @@ static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("audio/x-raw,"
                      "format=S16LE,"
-                     "rate={ 8000, 11250, 22500, 32000, 44100, 48000, 96000 },"
+                     "rate=[1, 2147483647],"
                      "channels=1")
     );
 
