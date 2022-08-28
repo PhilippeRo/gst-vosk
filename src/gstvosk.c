@@ -686,32 +686,25 @@ gst_vosk_set_property (GObject * object, guint prop_id,
 
       vosk->model_path = g_strdup (model_path);
 
-      gst_vosk_reset(vosk);
+      /* If we are in READY or NULL state, do nothing */
+      if (GST_STATE(vosk) <= GST_STATE_READY &&
+          GST_STATE_PENDING(vosk) <= GST_STATE_READY) {
+        GST_DEBUG_OBJECT(vosk, "not active");
+        break;
+      }
 
       if (!model_path) {
-        /* Deal with the cases when we are in a PAUSED or PLAYING states */
-        if (GST_STATE(vosk) >= GST_STATE_PAUSED ||
-            GST_STATE_PENDING(vosk) >= GST_STATE_PAUSED)
-          gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
-
-        return;
+        /* This will clean the model and cancel current attempts at loading. */
+        gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
+        GST_DEBUG_OBJECT(vosk, "model path is NULL");
+        break;
       }
 
-      /* See if we need to update our model. Only load a model without changing
-       * state if state/state pending are at least paused.
-       * At this point, all loading has been cancelled and there is not model
+      gst_vosk_reset(vosk);
+
+      /* At this point, all loading has been cancelled and there is no model
        * or recognizer loaded (see the call above). */
-      if (GST_STATE(vosk) >= GST_STATE_PAUSED ||
-          GST_STATE_PENDING(vosk) >= GST_STATE_PAUSED) {
-        gst_vosk_load_model(vosk);
-        GST_DEBUG_OBJECT(vosk, "state is PAUSED/PLAYING");
-        return;
-      }
-
-      /* This is for cases when we are in READY state and transitioning to
-       * PAUSED loading a model that was cancelled. */
-      GST_DEBUG_OBJECT(vosk, "sync with parent state after model changed");
-      gst_element_sync_state_with_parent (GST_ELEMENT(vosk));
+      gst_vosk_load_model(vosk);
       break;
     }
 
