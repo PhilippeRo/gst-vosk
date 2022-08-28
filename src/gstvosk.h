@@ -55,7 +55,6 @@ struct _GstVosk
   GstClockTime      last_partial;
   gint64            partial_time_interval;
 
-  GCancellable     *current_operation;
   GThreadPool      *thread_pool;
 
   GMutex            RecMut;
@@ -66,6 +65,7 @@ struct _GstVosk
   VoskRecognizer   *recognizer;
   gchar            *prev_partial;
   guint64           processed_size;
+  GCancellable     *current_operation;
   GQueue            buffer;
 };
 

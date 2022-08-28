@@ -174,23 +174,20 @@ gst_vosk_load_model_async (gpointer cancellable,
 
 /* Note : audio rate is handled by the application with the use of caps */
 
-static inline void
-gst_vosk_cancel_current_operation(GstVosk *vosk)
+static void
+gst_vosk_reset (GstVosk *vosk)
 {
+  GST_VOSK_LOCK(vosk);
+
+  /* This should be protected by a lock because otherwise the loading model
+   * function might check if it is cancelled right before we cancel it and then
+   * set the model anyway.*/
   if (vosk->current_operation) {
-    /* Cancel current operation */
+    /* Cancel current model loading operation */
     g_cancellable_cancel(vosk->current_operation);
     g_object_unref(vosk->current_operation);
     vosk->current_operation = NULL;
   }
-}
-
-static void
-gst_vosk_reset (GstVosk *vosk)
-{
-  gst_vosk_cancel_current_operation(vosk);
-
-  GST_VOSK_LOCK(vosk);
 
   g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
 
@@ -331,8 +328,6 @@ gst_vosk_get_rate(GstVosk *vosk)
   GstCaps *caps;
   gint rate = 0;
 
-  /* When calling this function, the caller must ensure (by taking the lock if
-   * need be that the model provided won't be destroyed by another thread */
   caps=gst_pad_get_current_caps(vosk->sinkpad);
   if (caps == NULL) {
     GST_INFO_OBJECT (vosk, "no capabilities set on sink pad.");
@@ -401,16 +396,18 @@ gst_vosk_load_model_real (GstVosk *vosk,
   /* This is why we do all this. Depending on the model size it can take a long
    * time before it returns. */
   model = vosk_model_new (model_path);
+  if (!model) {
+    GST_ERROR_OBJECT(vosk, "could not create model %s.", model_path);
+    return FALSE;
+  }
 
   GST_INFO_OBJECT (vosk, "model ready %s.", model_path);
 
   GST_VOSK_LOCK(vosk);
 
-  if (model == NULL) {
-    GST_ERROR_OBJECT(vosk, "could not create model %s.", model_path);
-    goto out;
-  }
-
+  /* The next statement should be protected with a lock so that we are not
+   * cancelled right after checking cancel status and before setting model.
+   * Otherwise, a stale model could remain. */
   if (g_cancellable_is_cancelled (status)) {
     GST_INFO_OBJECT (vosk, "model creation cancelled %s.", model_path);
     vosk_model_free (model);
@@ -419,7 +416,7 @@ gst_vosk_load_model_real (GstVosk *vosk,
 
   GST_INFO_OBJECT (vosk, "model set %s.", model_path);
 
-  /* That should not happen of there is an error in the code. Nothing but this
+  /* That should not happen or there is an error in the code. Nothing but this
    * function should be able to create a model !! And again, one thread at a
    * time. These tests are just to check. */
   if (G_UNLIKELY(vosk->model != NULL))
@@ -434,8 +431,9 @@ gst_vosk_load_model_real (GstVosk *vosk,
   vosk->recognizer = gst_vosk_recognizer_new (vosk, model, 0.0);
 
   /* Note: leave vosk->current_operation alone. It goes stale and will remain
-   * till another call to load_model() or till the end of the plugin's life.
-   * But leaving like that avoids lock operation.
+   * so till another call to load_model()/reset() or till the end of the
+   * plugin's life.
+   * But leaving it like that avoids lock operation when load_model sets it.
    * Just mark it as cancelled see calling function. */
 
   ret=TRUE;
@@ -989,7 +987,7 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
    * so 1/100 of a second = number of bytes / 100.
    * It means 5 buffers approx. */
   if (diff_time > (GST_SECOND / 2)) {
-    GST_INFO_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up (%lu)",
+    GST_DEBUG_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up (%lu)",
                      GST_TIME_ARGS(diff_time),
                      (vosk->processed_size % (guint64) vosk->rate));
 
