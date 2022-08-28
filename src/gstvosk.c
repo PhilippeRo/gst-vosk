@@ -546,6 +546,9 @@ gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
   GstStructure *contents;
   GValue value = G_VALUE_INIT;
 
+  if (!text_results)
+    return;
+
   contents = gst_structure_new_empty ("vosk");
 
   g_value_init (&value, G_TYPE_STRING);
