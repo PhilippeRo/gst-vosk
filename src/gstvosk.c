@@ -475,24 +475,24 @@ gst_vosk_load_model_async (gpointer thread_data,
     if (g_thread_pool_unprocessed (vosk->thread_pool))
         goto end;
 
-      GST_STATE_LOCK(GST_ELEMENT(vosk));
-      gst_element_abort_state (GST_ELEMENT(vosk));
-      GST_STATE_UNLOCK(GST_ELEMENT(vosk));
+    GST_STATE_LOCK(GST_ELEMENT(vosk));
+    gst_element_abort_state (GST_ELEMENT(vosk));
+    GST_STATE_UNLOCK(GST_ELEMENT(vosk));
 
-      gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
+    gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
     goto end;
   }
 
-  GST_STATE_LOCK (element);
-  gst_element_continue_state (element, GST_STATE_CHANGE_SUCCESS);
-  GST_STATE_UNLOCK (element);
+  GST_INFO_OBJECT (vosk, "async state change successfully completed.");
 
-  GST_INFO_OBJECT (vosk, "async state change successfully completed %i.", GST_STATE_RETURN(vosk));
-
-  /* FIXME: do we need abort/continue AND the following message ?? */
   message = gst_message_new_async_done (GST_OBJECT_CAST (vosk),
                                         GST_CLOCK_TIME_NONE);
   gst_element_post_message (element, message);
+
+  /* This is needed to change the state of the element (and the pipeline).*/
+  GST_STATE_LOCK (element);
+  gst_element_continue_state (element, GST_STATE_CHANGE_SUCCESS);
+  GST_STATE_UNLOCK (element);
 
 end:
 
