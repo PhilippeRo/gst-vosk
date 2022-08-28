@@ -1002,6 +1002,7 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
   if (result == 1) {
     GST_LOG_OBJECT (vosk, "checking result");
     gst_vosk_result(vosk);
+    vosk->last_partial=GST_BUFFER_PTS (buf);
     return;
   }
 
