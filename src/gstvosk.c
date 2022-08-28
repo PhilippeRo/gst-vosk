@@ -643,14 +643,11 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
     return GST_STATE_CHANGE_FAILURE;
 
   switch (transition) {
-    case GST_STATE_CHANGE_NULL_TO_NULL:
-    case GST_STATE_CHANGE_READY_TO_NULL:
     case GST_STATE_CHANGE_READY_TO_READY:
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       gst_vosk_reset (vosk);
       break;
 
-    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
     default:
       break;
   }
