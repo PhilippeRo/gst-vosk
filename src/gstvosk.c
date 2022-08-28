@@ -1026,7 +1026,7 @@ gst_vosk_chain_empty_buffer (GstVosk *vosk)
    * every ten buffers. It empties the queue. */
 
   buf = g_queue_pop_head (&vosk->buffer);
-  while (buf != NULL) {
+  while (buf) {
     gst_vosk_handle_buffer(vosk, buf);
     gst_buffer_unref(buf);
 
@@ -1052,12 +1052,12 @@ gst_vosk_chain (GstPad *sinkpad,
 
   GST_VOSK_LOCK(vosk);
 
-  if (vosk->need_flushing)
+  if (G_UNLIKELY(vosk->need_flushing))
     gst_vosk_flush(vosk);
 
-  if (G_LIKELY(vosk->recognizer != NULL)) {
-    /* Empty our buffer if need be */
-    if (G_UNLIKELY(g_queue_is_empty(&vosk->buffer) == FALSE)) {
+  if (G_LIKELY(vosk->recognizer)) {
+    /* Empty our queue if need be */
+    if (G_UNLIKELY(!g_queue_is_empty(&vosk->buffer))) {
       gst_buffer_ref(buf);
       g_queue_push_tail(&vosk->buffer, buf);
 
