@@ -50,6 +50,8 @@ struct _GstVosk
   gint              alternatives;
   gfloat            rate;
 
+  gboolean          need_flushing;
+
   GstClockTime      last_partial;
   gint64            partial_time_interval;
 

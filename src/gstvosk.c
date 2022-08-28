@@ -834,25 +834,6 @@ end:
   return success;
 }
 
-static void
-gst_vosk_flush(GstVosk *vosk)
-{
-  GST_INFO_OBJECT (vosk, "flushing");
-
-  /* Take the lock, empty queue and flush our recognizer */
-  GST_VOSK_LOCK(vosk);
-
-  g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
-  if (vosk->recognizer) {
-    vosk_recognizer_reset(vosk->recognizer);
-    vosk->processed_size = 0;
-  }
-  else
-    GST_DEBUG_OBJECT (vosk, "no recognizer to flush");
-
-  GST_VOSK_UNLOCK(vosk);
-}
-
 static gboolean
 gst_vosk_sink_event (GstPad *pad,
                      GstObject *parent,
@@ -875,7 +856,7 @@ gst_vosk_sink_event (GstPad *pad,
     }
 
     case GST_EVENT_FLUSH_START:
-      gst_vosk_flush(vosk);
+      vosk->need_flushing=TRUE;
       break;
 
     case GST_EVENT_EOS:
@@ -902,6 +883,25 @@ gst_vosk_sink_event (GstPad *pad,
  * The following functions are only called by gst_vosk_chain().
  * Which means that lock is held.
  */
+
+static void
+gst_vosk_flush(GstVosk *vosk)
+{
+  GST_INFO_OBJECT (vosk, "flushing");
+
+  /* Empty queue and flush our recognizer */
+  g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
+
+  if (vosk->recognizer) {
+    vosk_recognizer_reset(vosk->recognizer);
+    vosk->processed_size = 0;
+  }
+  else
+    GST_DEBUG_OBJECT (vosk, "no recognizer to flush");
+
+  vosk->need_flushing=FALSE;
+}
+
 static void
 gst_vosk_result (GstVosk *vosk)
 {
@@ -1051,6 +1051,9 @@ gst_vosk_chain (GstPad *sinkpad,
   GST_LOG_OBJECT (vosk, "data received");
 
   GST_VOSK_LOCK(vosk);
+
+  if (vosk->need_flushing)
+    gst_vosk_flush(vosk);
 
   if (G_LIKELY(vosk->recognizer != NULL)) {
     /* Empty our buffer if need be */
