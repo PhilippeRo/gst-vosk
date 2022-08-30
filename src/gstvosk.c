@@ -397,7 +397,12 @@ gst_vosk_load_model_real (GstVosk *vosk,
    * time before it returns. */
   model = vosk_model_new (model_path);
   if (!model) {
-    GST_ERROR_OBJECT(vosk, "could not create model %s.", model_path);
+    GST_ERROR_OBJECT(vosk, "could not create model object for %s.", model_path);
+    GST_ELEMENT_ERROR(GST_ELEMENT(vosk),
+                      RESOURCE,
+                      NOT_FOUND,
+                      ("model could not be loaded"),
+                      ("an error was encountered while loading model (%s)", model_path));
     return FALSE;
   }
 
@@ -469,9 +474,6 @@ gst_vosk_load_model_async (gpointer thread_data,
 
   if (!gst_vosk_load_model_real (vosk, model_path, status)) {
       /* NOTE: at this point vosk->model and model MUST be NULL since we fail */
-
-    /* If we failed or were cancelled, move back to READY state, unless there is
-     * another thread waiting to load a new model. */
     if (g_thread_pool_unprocessed (vosk->thread_pool))
         goto end;
 
@@ -479,7 +481,8 @@ gst_vosk_load_model_async (gpointer thread_data,
     gst_element_abort_state (GST_ELEMENT(vosk));
     GST_STATE_UNLOCK(GST_ELEMENT(vosk));
 
-    gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
+    /* If it was cancelled, the function that cancelled it is responsible to
+     * error out, to start loading a new model, ... */
     goto end;
   }
 
@@ -513,7 +516,8 @@ gst_vosk_load_model (GstVosk *vosk)
 
   /* Note: the function is called with vosk->model_path != NULL and
    * vosk->model == NULL and vosk->current_operation == NULL.
-   * That is the reason why we can call it without LOCK held. */
+   * That is the reason why we can call it without LOCK held.
+   * vosk->model_path != NULL. */
 
   GST_DEBUG_OBJECT (vosk, "num loading threads %i", g_thread_pool_unprocessed (vosk->thread_pool));
 
@@ -526,12 +530,6 @@ gst_vosk_load_model (GstVosk *vosk)
                      thread_data,
                      NULL);
 
-  /* FIXME: try skipping the async message and return success
-   * so that we are passed the buffers while we load.
-   * Benefits: get rid of queue element, there might be some performance gains
-   * and there would be consistency since when we are PLAYING and loading a new
-   * model, then we don't tell the pipeline about it and keep receiving buffers.
-   */
   message = gst_message_new_async_start (GST_OBJECT_CAST (vosk));
   gst_element_post_message (GST_ELEMENT (vosk), message);
   return GST_STATE_CHANGE_ASYNC;
@@ -693,14 +691,17 @@ gst_vosk_set_property (GObject * object, guint prop_id,
         break;
       }
 
+      gst_vosk_reset(vosk);
+
       if (!model_path) {
-        /* This will clean the model and cancel current attempts at loading. */
-        gst_element_set_state(GST_ELEMENT(vosk), GST_STATE_READY);
+        GST_ELEMENT_ERROR(GST_ELEMENT(vosk),
+                          RESOURCE,
+                          NOT_FOUND,
+                          ("Impossible to load model"),
+                          ("No model path is set"));
         GST_DEBUG_OBJECT(vosk, "model path is NULL");
         break;
       }
-
-      gst_vosk_reset(vosk);
 
       /* At this point, all loading has been cancelled and there is no model
        * or recognizer loaded (see the call above). */
