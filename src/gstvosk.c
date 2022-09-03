@@ -459,7 +459,7 @@ gst_vosk_load_model_async (gpointer thread_data,
   gchar *model_path;
 
   status = G_CANCELLABLE(((GstVoskThreadData *)thread_data)->cancellable);
-  model_path = g_strdup(((GstVoskThreadData *)thread_data)->model_path);
+  model_path = ((GstVoskThreadData *)thread_data)->model_path;
 
   /* There can be only one model loading at a time. Even when loading has been
    * cancelled for one model while it was waiting to be loaded.
