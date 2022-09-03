@@ -14,7 +14,8 @@ Building this plugin
 
 To install the plugin in /usr (where most distributions put Gstreamer plugins):
 ```
-meson setup builddir
-meson compile --prefix=/usr
+meson setup builddir --prefix=/usr
+cd builddir
+meson compile
 meson install
 ```
