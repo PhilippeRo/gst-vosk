@@ -54,10 +54,9 @@ enum
 };
 
 /*
- * gst-launch-1.0 -m pulsesrc ! queue2 max-size-time=0 max-size-buffers=0 \
- *                   max-size-bytes=4294967294 ! audio/x-raw,format=S16LE,rate=44100, \
- *                   channels=1 ! vosk alternatives=0 speech-model=path/to/model \
- *                   ! fakesink
+ * gst-launch-1.0 -m pulsesrc  buffer-time=9223372036854775807 ! \
+ *                   audio/x-raw,format=S16LE,rate=16000, channels=1 ! \
+ *                   vosk speech-model=path/to/model ! fakesink
 */
 
 #define VOSK_EMPTY_PARTIAL_RESULT  "{\n  \"partial\" : \"\"\n}"
@@ -115,14 +114,6 @@ enum
 
 #endif
 
-#define GST_VOSK_LOADING_MODEL(vosk) (vosk->current_operation != NULL && \
-                                      g_cancellable_is_cancelled(vosk->current_operation) == FALSE)
-
-typedef struct {
-  gchar *model_path;
-  GCancellable *cancellable;
-} GstVoskThreadData;
-
 /* the capabilities of the inputs and outputs. */
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -169,55 +160,15 @@ static void
 gst_vosk_partial_result (GstVosk *vosk);
 
 static void
-gst_vosk_load_model_async (gpointer cancellable,
+gst_vosk_load_model_async (gpointer thread_data,
                            gpointer element);
 
 /* Note : audio rate is handled by the application with the use of caps */
 
 static void
-gst_vosk_reset (GstVosk *vosk)
-{
-  GST_VOSK_LOCK(vosk);
-
-  /* This should be protected by a lock because otherwise the loading model
-   * function might check if it is cancelled right before we cancel it and then
-   * set the model anyway.*/
-  if (vosk->current_operation) {
-    /* Cancel current model loading operation */
-    g_cancellable_cancel(vosk->current_operation);
-    g_object_unref(vosk->current_operation);
-    vosk->current_operation = NULL;
-  }
-
-  g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
-
-  if (vosk->recognizer) {
-    vosk_recognizer_free (vosk->recognizer);
-    vosk->recognizer = NULL;
-    vosk->processed_size = 0;
-  }
-
-  if (vosk->model != NULL) {
-    vosk_model_free (vosk->model);
-    vosk->model = NULL;
-  }
-
-  if (vosk->prev_partial) {
-    g_free (vosk->prev_partial);
-    vosk->prev_partial = NULL;
-  }
-
-  GST_VOSK_UNLOCK(vosk);
-
-  vosk->rate=0.0;
-}
-
-static void
 gst_vosk_finalize (GObject *object)
 {
   GstVosk *vosk = GST_VOSK (object);
-
-  gst_vosk_reset(vosk);
 
   if (vosk->model_path) {
     g_free (vosk->model_path);
@@ -258,7 +209,7 @@ gst_vosk_class_init (GstVoskClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_SPEECH_MODEL,
       g_param_spec_string ("speech-model", "Speech Model", _("Location (path) of the speech model."),
-          DEFAULT_SPEECH_MODEL, G_PARAM_READWRITE));
+          DEFAULT_SPEECH_MODEL, G_PARAM_READWRITE|GST_PARAM_MUTABLE_READY));
 
   g_object_class_install_property (gobject_class, PROP_ALTERNATIVES,
       g_param_spec_int ("alternatives", "Alternative Number", _("Number of alternative results returned."),
@@ -307,12 +258,7 @@ gst_vosk_init (GstVosk * vosk)
   vosk->rate = 0.0;
   vosk->processed_size = 0;
   vosk->alternatives = DEFAULT_ALTERNATIVE_NUM;
-  vosk->prev_partial = NULL;
   vosk->model_path = g_strdup(DEFAULT_SPEECH_MODEL);
-  vosk->recognizer = NULL;
-  vosk->model = NULL;
-
-  g_queue_init(&vosk->buffer);
 
   vosk->thread_pool=g_thread_pool_new((GFunc) gst_vosk_load_model_async,
                                       vosk,
@@ -383,153 +329,6 @@ gst_vosk_recognizer_new (GstVosk *vosk,
   return recognizer;
 }
 
-static gboolean
-gst_vosk_load_model_real (GstVosk *vosk,
-                          const gchar *model_path,
-                          GCancellable *status)
-{
-  gboolean ret = FALSE;
-  VoskModel *model;
-
-  GST_INFO_OBJECT (vosk, "creating model %s.", model_path);
-
-  /* This is why we do all this. Depending on the model size it can take a long
-   * time before it returns. */
-  model = vosk_model_new (model_path);
-  if (!model) {
-    GST_ERROR_OBJECT(vosk, "could not create model object for %s.", model_path);
-    GST_ELEMENT_ERROR(GST_ELEMENT(vosk),
-                      RESOURCE,
-                      NOT_FOUND,
-                      ("model could not be loaded"),
-                      ("an error was encountered while loading model (%s)", model_path));
-    return FALSE;
-  }
-
-  GST_INFO_OBJECT (vosk, "model ready %s.", model_path);
-
-  GST_VOSK_LOCK(vosk);
-
-  /* The next statement should be protected with a lock so that we are not
-   * cancelled right after checking cancel status and before setting model.
-   * Otherwise, a stale model could remain. */
-  if (g_cancellable_is_cancelled (status)) {
-    GST_INFO_OBJECT (vosk, "model creation cancelled %s.", model_path);
-    vosk_model_free (model);
-    goto out;
-  }
-
-  GST_INFO_OBJECT (vosk, "model set %s.", model_path);
-
-  /* That should not happen or there is an error in the code. Nothing but this
-   * function should be able to create a model !! And again, one thread at a
-   * time. These tests are just to check. */
-  if (G_UNLIKELY(vosk->model != NULL))
-    GST_ERROR_OBJECT (vosk, "model is not NULL.");
-
-  if (G_UNLIKELY(vosk->recognizer != NULL))
-    GST_ERROR_OBJECT (vosk, "recognizer is not NULL.");
-
-  /* This is the only place where vosk->model can be set and only one thread
-   * at a time can do it. */
-  vosk->model = model;
-  vosk->recognizer = gst_vosk_recognizer_new (vosk, model, 0.0);
-
-  /* Note: leave vosk->current_operation alone. It goes stale and will remain
-   * so till another call to load_model()/reset() or till the end of the
-   * plugin's life.
-   * But leaving it like that avoids lock operation when load_model sets it.
-   * Just mark it as cancelled see calling function. */
-
-  ret=TRUE;
-
-out:
-
-  GST_VOSK_UNLOCK(vosk);
-  return ret;
-}
-
-static void
-gst_vosk_load_model_async (gpointer thread_data,
-                           gpointer element)
-{
-  GstVosk *vosk = GST_VOSK (element);
-  GCancellable *status;
-  GstMessage *message;
-  gchar *model_path;
-
-  status = G_CANCELLABLE(((GstVoskThreadData *)thread_data)->cancellable);
-  model_path = ((GstVoskThreadData *)thread_data)->model_path;
-
-  /* There can be only one model loading at a time. Even when loading has been
-   * cancelled for one model while it was waiting to be loaded.
-   * In this latter case, wait for it to notice it was cancelled and leave.
-   */
-
-  /* Thread might have been cancelled while waiting, so check that */
-  if (g_cancellable_is_cancelled (status)) {
-    GST_INFO_OBJECT (vosk, "model creation cancelled before even trying.");
-    goto end;
-  }
-
-  if (!gst_vosk_load_model_real (vosk, model_path, status)) {
-      /* NOTE: at this point vosk->model and model MUST be NULL since we fail */
-    if (g_thread_pool_unprocessed (vosk->thread_pool))
-        goto end;
-
-    GST_STATE_LOCK(GST_ELEMENT(vosk));
-    gst_element_abort_state (GST_ELEMENT(vosk));
-    GST_STATE_UNLOCK(GST_ELEMENT(vosk));
-
-    /* If it was cancelled, the function that cancelled it is responsible to
-     * error out, to start loading a new model, ... */
-    goto end;
-  }
-
-  GST_INFO_OBJECT (vosk, "async state change successfully completed.");
-
-  message = gst_message_new_async_done (GST_OBJECT_CAST (vosk),
-                                        GST_CLOCK_TIME_NONE);
-  gst_element_post_message (element, message);
-
-  /* This is needed to change the state of the element (and the pipeline).*/
-  GST_STATE_LOCK (element);
-  gst_element_continue_state (element, GST_STATE_CHANGE_SUCCESS);
-  GST_STATE_UNLOCK (element);
-
-end:
-
-  g_cancellable_cancel(status);
-  g_object_unref(status);
-  g_free(model_path);
-  g_free(thread_data);
-}
-
-/*
- * NO NEED to call it with any lock held from main thread
- */
-static void
-gst_vosk_load_model (GstVosk *vosk)
-{
-  GstVoskThreadData * thread_data;
-
-  /* Note: the function is called with vosk->model_path != NULL and
-   * vosk->model == NULL and vosk->current_operation == NULL.
-   * That is the reason why we can call it without LOCK held.
-   * vosk->model_path != NULL. */
-
-  GST_DEBUG_OBJECT (vosk, "num loading threads %i", g_thread_pool_unprocessed (vosk->thread_pool));
-
-  /* Start a new model loading process */
-  vosk->current_operation = g_cancellable_new();
-  thread_data=g_new0(GstVoskThreadData, 1);
-  thread_data->cancellable=g_object_ref(vosk->current_operation);
-  thread_data->model_path=g_strdup(vosk->model_path);
-  g_thread_pool_push(vosk->thread_pool,
-                     thread_data,
-                     NULL);
-}
-
 static void
 gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
 {
@@ -597,28 +396,61 @@ end:
   return NULL;
 }
 
-static GstStateChangeReturn
-gst_vosk_check_model_state(GstElement *element)
+static void
+gst_vosk_reset (GstVosk *vosk)
 {
-  GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
-  GstVosk *vosk = GST_VOSK (element);
-
-  if (!vosk->model_path)
-    return GST_STATE_CHANGE_FAILURE;
-
-  /* Only try to load a model if there isn't one and if none is being loaded */
-  if (!vosk->model && !GST_VOSK_LOADING_MODEL(vosk)) {
-    GstMessage *message;
-
-    gst_vosk_load_model (vosk);
-    message = gst_message_new_async_start (GST_OBJECT_CAST (vosk));
-    gst_element_post_message (GST_ELEMENT (vosk), message);
-    ret = GST_STATE_CHANGE_ASYNC;
+  if (vosk->recognizer) {
+    vosk_recognizer_free (vosk->recognizer);
+    vosk->recognizer = NULL;
+    vosk->processed_size = 0;
   }
-  else
-    ret = GST_STATE_CHANGE_SUCCESS;
 
-  return ret;
+  if (vosk->model != NULL) {
+    vosk_model_free (vosk->model);
+    vosk->model = NULL;
+  }
+
+  if (vosk->prev_partial) {
+    g_free (vosk->prev_partial);
+    vosk->prev_partial = NULL;
+  }
+
+  vosk->rate=0.0;
+}
+
+static void
+gst_vosk_cancel_model_loading(GstVosk *vosk)
+{
+  GST_VOSK_LOCK(vosk);
+  if (!vosk->current_operation)
+    return;
+
+  g_cancellable_cancel(vosk->current_operation);
+  g_object_unref(vosk->current_operation);
+  vosk->current_operation=NULL;
+
+  g_cond_signal(&vosk->wake_stream);
+  GST_VOSK_UNLOCK(vosk);
+}
+
+static GstStateChangeReturn
+gst_vosk_check_model_path(GstElement *element)
+{
+  GstVosk *vosk = GST_VOSK (element);
+  GstMessage *message;
+
+  if (!vosk->model_path) {
+      GST_ELEMENT_ERROR(vosk,
+                        RESOURCE,
+                        NOT_FOUND,
+                        ("model could not be loaded"),
+                        ("there is not model set"));
+    return GST_STATE_CHANGE_FAILURE;
+  }
+
+  message = gst_message_new_async_start (GST_OBJECT_CAST (element));
+  gst_element_post_message (element, message);
+  return GST_STATE_CHANGE_ASYNC;
 }
 
 static GstStateChangeReturn
@@ -631,21 +463,31 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
     case GST_STATE_CHANGE_PAUSED_TO_PAUSED:
-      ret=gst_vosk_check_model_state(element);
+      ret=gst_vosk_check_model_path(element);
       if (ret == GST_STATE_CHANGE_FAILURE)
         return GST_STATE_CHANGE_FAILURE;
+      break;
+
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      /* This must be before GstElement's change_state default function. */
+      gst_vosk_cancel_model_loading(vosk);
 
     default:
       break;
   }
 
-  if (GST_ELEMENT_CLASS (parent_class)->change_state (element, transition) == GST_STATE_CHANGE_FAILURE)
+  if (GST_ELEMENT_CLASS (parent_class)->change_state (element, transition) == GST_STATE_CHANGE_FAILURE){
+    GST_DEBUG_OBJECT (vosk, "State change failure");
     return GST_STATE_CHANGE_FAILURE;
+  }
 
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_READY:
     case GST_STATE_CHANGE_PAUSED_TO_READY:
+      /* Take the stream lock and wait for it to end */
+      GST_PAD_STREAM_LOCK(vosk->sinkpad);
       gst_vosk_reset (vosk);
+      GST_PAD_STREAM_UNLOCK(vosk->sinkpad);
       break;
 
     default:
@@ -668,14 +510,7 @@ gst_vosk_set_property (GObject * object, guint prop_id,
       const gchar *model_path;
 
       model_path = g_value_get_string (value);
-
-      GST_DEBUG_OBJECT (vosk, "model change %s (state = %i %i %i %i %i)",
-                        model_path,
-                        GST_STATE(vosk),
-                        GST_STATE_NEXT(vosk),
-                        GST_STATE_TARGET(vosk),
-                        GST_STATE_PENDING(vosk),
-                        GST_STATE_RETURN(vosk));
+      GST_INFO_OBJECT (vosk, "new path for model %s", model_path);
 
       if(!g_strcmp0 (model_path, vosk->model_path))
         return;
@@ -685,29 +520,7 @@ gst_vosk_set_property (GObject * object, guint prop_id,
 
       vosk->model_path = g_strdup (model_path);
 
-      /* If we are in READY or NULL state, do nothing */
-      if (GST_STATE(vosk) <= GST_STATE_READY &&
-          GST_STATE_PENDING(vosk) <= GST_STATE_READY) {
-        GST_DEBUG_OBJECT(vosk, "not active");
-        break;
-      }
-
-      gst_vosk_reset(vosk);
-
-      if (!model_path) {
-        GST_ELEMENT_ERROR(GST_ELEMENT(vosk),
-                          RESOURCE,
-                          NOT_FOUND,
-                          ("Impossible to load model"),
-                          ("No model path is set"));
-        GST_DEBUG_OBJECT(vosk, "model path is NULL");
-        break;
-      }
-
-      /* At this point, all loading has been cancelled and there is no model
-       * or recognizer loaded (see the call above). */
-      gst_vosk_load_model(vosk);
-      gst_element_lost_state(GST_ELEMENT(vosk));
+      /* This property can only be changed in the READY state */
       break;
     }
 
@@ -789,7 +602,7 @@ gst_vosk_set_caps (GstVosk *vosk, GstCaps *caps)
 
   if (vosk->recognizer) {
     if (G_UNLIKELY((gfloat) rate == vosk->rate)) {
-      GST_INFO_OBJECT (vosk, "rate has not changed; keeping current recognizer.");
+      GST_INFO_OBJECT (vosk, "rate has not changed; keeping current recognizer");
       goto end;
     }
 
@@ -802,16 +615,11 @@ gst_vosk_set_caps (GstVosk *vosk, GstCaps *caps)
     vosk_recognizer_free (vosk->recognizer);
   }
   else if (!vosk->model) {
-    /* See if we are creating a model. */
-    if (vosk->current_operation)
-      GST_INFO_OBJECT (vosk, "model and recognizer are being created");
-    else
-      GST_INFO_OBJECT (vosk, "no model or recognizer ready to set rate yet");
-
+    GST_INFO_OBJECT (vosk, "model not yet loaded");
     goto end;
   }
   else
-    GST_INFO_OBJECT (vosk, "no recognizer yet available to set rate ; creating one.");
+    GST_INFO_OBJECT (vosk, "no recognizer yet available to set rate ; creating one");
 
   vosk->recognizer = gst_vosk_recognizer_new (vosk, vosk->model, rate);
 
@@ -837,9 +645,6 @@ gst_vosk_flush(GstVosk *vosk)
   GST_INFO_OBJECT (vosk, "flushing");
 
   GST_VOSK_LOCK(vosk);
-
-  /* Empty queue and flush our recognizer */
-  g_queue_clear_full(&vosk->buffer, (GDestroyNotify) gst_buffer_unref);
 
   if (vosk->recognizer) {
     vosk_recognizer_reset(vosk->recognizer);
@@ -880,10 +685,14 @@ gst_vosk_sink_event (GstPad *pad,
     {
       const gchar *json_txt;
 
-      GST_VOSK_LOCK(vosk);
+      /* Cancel any ongoing loading */
+      gst_vosk_cancel_model_loading(vosk);
+
+      /* Wait for the stream to complete */
+      GST_PAD_STREAM_LOCK(vosk->sinkpad);
       json_txt = gst_vosk_final_result (vosk);
       gst_vosk_message_new (vosk, json_txt);
-      GST_VOSK_UNLOCK(vosk);
+      GST_PAD_STREAM_UNLOCK(vosk->sinkpad);
 
       GST_DEBUG_OBJECT (vosk, "EOS stop event");
       break;
@@ -989,6 +798,8 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
                      GST_TIME_ARGS(diff_time),
                      (vosk->processed_size % (guint64) vosk->rate));
 
+    /* FIXME: this does not always work when the buffer size does not match
+     * the size in bytes of a frame. */
     if ((vosk->processed_size % (guint64) vosk->rate) >= info.size)
       return;
 
@@ -1013,31 +824,116 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
   }
 }
 
-static void
-gst_vosk_chain_empty_buffer (GstVosk *vosk)
+typedef struct {
+  gchar *path;
+  GCancellable *cancellable;
+} GstVoskThreadData;
+
+static gboolean
+gst_vosk_load_model_real (GstVosk *vosk,
+                          GstVoskThreadData *status)
 {
-  GstBuffer *buf;
-  gint num_buf=0;
+  gboolean ret = FALSE;
+  VoskModel *model;
 
-  GST_DEBUG_OBJECT (vosk, "emptying queue buffer.");
+  GST_INFO_OBJECT (vosk, "creating model %s.", status->path);
 
-  /* Try to catch up, feed it everything and only check if we were cancelled
-   * every ten buffers. It empties the queue. */
+  /* This is why we do all this. Depending on the model size it can take a long
+   * time before it returns. */
+  model = vosk_model_new (status->path);
 
-  buf = g_queue_pop_head (&vosk->buffer);
-  while (buf) {
-    gst_vosk_handle_buffer(vosk, buf);
-    gst_buffer_unref(buf);
+  GST_VOSK_LOCK(vosk);
 
-    if (num_buf++ > 10){
-      GST_DEBUG_OBJECT (vosk, "processed 10 buffers in the queue, there is more to process");
-      return;
-    }
+  /* The next statement should be protected with a lock so that we are not
+   * cancelled right after checking cancel status and before setting model.
+   * Otherwise, a stale model could remain. */
+  if (g_cancellable_is_cancelled (status->cancellable)) {
+    GST_INFO_OBJECT (vosk, "model creation cancelled %s.", status->path);
+    vosk_model_free (model);
 
-    buf = g_queue_pop_head(&vosk->buffer);
+    /* Note: in this case don't use condition, not our problem anymore */
+    goto out_lock;
   }
 
-  GST_INFO_OBJECT (vosk, "processed all buffers in the queue");
+  /* Do this here to make sure the following is still relevant */
+  if (!model) {
+    GST_ERROR_OBJECT(vosk, "could not create model object for %s.", status->path);
+    GST_ELEMENT_ERROR(GST_ELEMENT(vosk),
+                      RESOURCE,
+                      NOT_FOUND,
+                      ("model could not be loaded"),
+                      ("an error was encountered while loading model (%s)", status->path));
+    goto out_condition;
+  }
+
+  GST_INFO_OBJECT (vosk, "model ready %s.", status->path);
+
+  /* This is the only place where vosk->model can be set and only one thread
+   * at a time can do it. */
+  vosk->model = model;
+  vosk->recognizer = gst_vosk_recognizer_new (vosk, model, 0.0);
+
+  /* Note: leave current_operation alone. It is cleaned outside that thread. */
+
+  ret=TRUE;
+
+out_condition:
+
+  /* Wake streaming thread, unless we were cancelled */
+  g_cond_signal(&vosk->wake_stream);
+
+out_lock:
+
+  GST_VOSK_UNLOCK(vosk);
+  return ret;
+}
+
+static void
+gst_vosk_load_model_async (gpointer thread_data,
+                           gpointer element)
+{
+  GstVoskThreadData *status = thread_data;
+  GstVosk *vosk = GST_VOSK (element);
+  GstMessage *message;
+
+  /* There can be only one model loading at a time. Even when loading has been
+   * cancelled for one model while it was waiting to be loaded.
+   * In this latter case, wait for it to notice it was cancelled and leave.*/
+
+  /* Thread might have been cancelled while waiting, so check that */
+  if (g_cancellable_is_cancelled (status->cancellable)) {
+    GST_INFO_OBJECT (vosk, "model creation cancelled before even trying.");
+    /* Note: don't use condition, it's not our problem any more */
+    goto clean;
+  }
+
+  if (!gst_vosk_load_model_real (vosk, status)) {
+    /* If the lock can't be taken then there is a state change and what follows
+     * is useless. Otherwise, it's probably an error like a wrong path. */
+    if (GST_STATE_TRYLOCK(vosk)) {
+      gst_element_abort_state (GST_ELEMENT(vosk));
+      GST_STATE_UNLOCK(GST_ELEMENT(vosk));
+    }
+    goto clean;
+  }
+
+  GST_INFO_OBJECT (vosk, "async state change successfully completed.");
+
+  message = gst_message_new_async_done (GST_OBJECT_CAST (vosk),
+                                        GST_CLOCK_TIME_NONE);
+  gst_element_post_message (element, message);
+
+  /* This is needed to change the state of the element (and the pipeline).*/
+  GST_STATE_LOCK (element);
+  gst_element_continue_state (element, GST_STATE_CHANGE_SUCCESS);
+  GST_STATE_UNLOCK (element);
+
+clean:
+
+  g_cancellable_cancel(status->cancellable);
+  g_object_unref(status->cancellable);
+  g_free(status->path);
+  g_free(status);
 }
 
 static GstFlowReturn
@@ -1051,23 +947,29 @@ gst_vosk_chain (GstPad *sinkpad,
 
   GST_VOSK_LOCK(vosk);
 
-  if (G_LIKELY(vosk->recognizer)) {
-    /* Empty our queue if need be */
-    if (G_UNLIKELY(!g_queue_is_empty(&vosk->buffer))) {
-      gst_buffer_ref(buf);
-      g_queue_push_tail(&vosk->buffer, buf);
+  if (G_UNLIKELY(!vosk->recognizer)) {
+    GstVoskThreadData *thread_data;
 
-      gst_vosk_chain_empty_buffer(vosk);
+    /* Start loading a new model */
+    vosk->current_operation=g_cancellable_new();
+
+    thread_data=g_new0(GstVoskThreadData, 1);
+    thread_data->cancellable=g_object_ref(vosk->current_operation);
+    thread_data->path=g_strdup(vosk->model_path);
+    g_thread_pool_push(vosk->thread_pool,
+                       thread_data,
+                       NULL);
+
+    /* Block until the thread finishes or until it is cancelled */
+    g_cond_wait(&vosk->wake_stream, &vosk->RecMut);
+    GST_INFO_OBJECT (vosk, "woken up, model should be ready");
+    if (!vosk->model || !vosk->recognizer) {
+      GST_VOSK_UNLOCK(vosk);
+      return GST_FLOW_OK;
     }
-    else
-      gst_vosk_handle_buffer(vosk, buf);
   }
-  else {
-    GST_LOG_OBJECT (vosk, "buffering");
 
-    gst_buffer_ref(buf);
-    g_queue_push_tail(&vosk->buffer, buf);
-  }
+  gst_vosk_handle_buffer(vosk, buf);
 
   GST_VOSK_UNLOCK(vosk);
 

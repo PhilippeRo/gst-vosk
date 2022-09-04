@@ -63,8 +63,9 @@ struct _GstVosk
   VoskRecognizer   *recognizer;
   gchar            *prev_partial;
   guint64           processed_size;
+
   GCancellable     *current_operation;
-  GQueue            buffer;
+  GCond             wake_stream;
 };
 
 struct _GstVoskClass
