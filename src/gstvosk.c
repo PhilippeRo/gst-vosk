@@ -508,10 +508,9 @@ end:
 /*
  * NO NEED to call it with any lock held from main thread
  */
-static GstStateChangeReturn
+static void
 gst_vosk_load_model (GstVosk *vosk)
 {
-  GstMessage *message;
   GstVoskThreadData * thread_data;
 
   /* Note: the function is called with vosk->model_path != NULL and
@@ -529,10 +528,6 @@ gst_vosk_load_model (GstVosk *vosk)
   g_thread_pool_push(vosk->thread_pool,
                      thread_data,
                      NULL);
-
-  message = gst_message_new_async_start (GST_OBJECT_CAST (vosk));
-  gst_element_post_message (GST_ELEMENT (vosk), message);
-  return GST_STATE_CHANGE_ASYNC;
 }
 
 static void
@@ -612,8 +607,14 @@ gst_vosk_check_model_state(GstElement *element)
     return GST_STATE_CHANGE_FAILURE;
 
   /* Only try to load a model if there isn't one and if none is being loaded */
-  if (!vosk->model && !GST_VOSK_LOADING_MODEL(vosk))
-    ret = gst_vosk_load_model (vosk);
+  if (!vosk->model && !GST_VOSK_LOADING_MODEL(vosk)) {
+    GstMessage *message;
+
+    gst_vosk_load_model (vosk);
+    message = gst_message_new_async_start (GST_OBJECT_CAST (vosk));
+    gst_element_post_message (GST_ELEMENT (vosk), message);
+    ret = GST_STATE_CHANGE_ASYNC;
+  }
   else
     ret = GST_STATE_CHANGE_SUCCESS;
 
@@ -706,6 +707,7 @@ gst_vosk_set_property (GObject * object, guint prop_id,
       /* At this point, all loading has been cancelled and there is no model
        * or recognizer loaded (see the call above). */
       gst_vosk_load_model(vosk);
+      gst_element_lost_state(GST_ELEMENT(vosk));
       break;
     }
 
