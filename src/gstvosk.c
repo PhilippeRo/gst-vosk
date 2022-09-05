@@ -383,9 +383,9 @@ end:
   GST_INFO_OBJECT(vosk, "final results");
 
   if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
-    return json_txt;
+    return NULL;
 
-  return NULL;
+  return json_txt;
 }
 
 static void
