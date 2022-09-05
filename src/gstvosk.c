@@ -49,8 +49,8 @@ enum
   PROP_0,
   PROP_SPEECH_MODEL,
   PROP_ALTERNATIVES,
-  PROP_RESULT,
-  PROP_PARTIAL_RESULTS,
+  PROP_CURRENT_FINAL_RESULTS,
+  PROP_PARTIAL_RESULTS_INTERVAL,
 };
 
 /*
@@ -154,12 +154,6 @@ static GstFlowReturn
 gst_vosk_chain (GstPad * pad, GstObject * parent, GstBuffer * buf);
 
 static void
-gst_vosk_result (GstVosk *vosk);
-
-static void
-gst_vosk_partial_result (GstVosk *vosk);
-
-static void
 gst_vosk_load_model_async (gpointer thread_data,
                            gpointer element);
 
@@ -179,19 +173,6 @@ gst_vosk_finalize (GObject *object)
   vosk->thread_pool=NULL;
 
   GST_DEBUG_OBJECT (vosk, "finalizing.");
-}
-
-static void
-gst_vosk_set_num_alternatives(GstVosk *vosk)
-{
-  GST_VOSK_LOCK(vosk);
-
-  if (vosk->recognizer)
-    vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
-  else
-    GST_LOG_OBJECT (vosk, "No recognizer to set num alternatives.");
-
-  GST_VOSK_UNLOCK(vosk);
 }
 
 static void
@@ -215,12 +196,12 @@ gst_vosk_class_init (GstVoskClass * klass)
       g_param_spec_int ("alternatives", "Alternative Number", _("Number of alternative results returned."),
           0, 100, DEFAULT_ALTERNATIVE_NUM, G_PARAM_READWRITE));
 
-  g_object_class_install_property (gobject_class, PROP_RESULT,
-      g_param_spec_string ("final-results", "Get recognizer's final results", _("Force the recognizer to return final results."),
+  g_object_class_install_property (gobject_class, PROP_CURRENT_FINAL_RESULTS,
+      g_param_spec_string ("current-final-results", "Get recognizer's current final results", _("Force the recognizer to return final results."),
           NULL, G_PARAM_READABLE));
 
-  g_object_class_install_property (gobject_class, PROP_PARTIAL_RESULTS,
-      g_param_spec_int64 ("partial-results", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results."),
+  g_object_class_install_property (gobject_class, PROP_PARTIAL_RESULTS_INTERVAL,
+      g_param_spec_int64 ("partial-results-interval", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results."),
           -1,G_MAXINT64, 0, G_PARAM_READWRITE));
 
   gst_element_class_set_details_simple(gstelement_class,
@@ -265,127 +246,6 @@ gst_vosk_init (GstVosk * vosk)
                                       1,
                                       FALSE,
                                       NULL);
-}
-
-static gint
-gst_vosk_get_rate(GstVosk *vosk)
-{
-  GstStructure *caps_struct;
-  GstCaps *caps;
-  gint rate = 0;
-
-  caps=gst_pad_get_current_caps(vosk->sinkpad);
-  if (caps == NULL) {
-    GST_INFO_OBJECT (vosk, "no capabilities set on sink pad.");
-    return 0;
-  }
-
-  caps_struct = gst_caps_get_structure (caps, 0);
-  if (caps_struct == NULL) {
-    GST_INFO_OBJECT (vosk, "no capabilities structure.");
-    return 0;
-  }
-
-  if (gst_structure_get_int (caps_struct, "rate", &rate) == FALSE) {
-    GST_INFO_OBJECT (vosk, "no rate set in the capabilities");
-    return 0;
-  }
-
-  return rate;
-}
-
-/*
- * MUST be called with lock held
- */
-static gboolean
-gst_vosk_recognizer_new (GstVosk *vosk)
-{
-  vosk->rate = gst_vosk_get_rate(vosk);
-  if (vosk->rate <= 0.0) {
-    GST_INFO_OBJECT (vosk, "rate not set yet: no recognizer created.");
-    return FALSE;
-  }
-
-  GST_INFO_OBJECT (vosk, "current rate is %f", vosk->rate);
-
-  if (vosk->model == NULL) {
-    GST_INFO_OBJECT (vosk, "no model provided.");
-    return FALSE;
-  }
-
-  vosk->processed_size = 0;
-
-  GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", vosk->rate);
-  vosk->recognizer = vosk_recognizer_new (vosk->model, vosk->rate);
-  vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
-  return TRUE;
-}
-
-static void
-gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
-{
-  GstMessage *msg;
-  GstStructure *contents;
-  GValue value = G_VALUE_INIT;
-
-  if (!text_results)
-    return;
-
-  contents = gst_structure_new_empty ("vosk");
-
-  g_value_init (&value, G_TYPE_STRING);
-  g_value_set_string (&value, text_results);
-
-  gst_structure_set_value (contents, "current-result", &value);
-  g_value_unset (&value);
-
-  msg = gst_message_new_element (GST_OBJECT (vosk), contents);
-  gst_element_post_message (GST_ELEMENT (vosk), msg);
-}
-
-/*
- * MUST be called with lock held
- */
-static const gchar *
-gst_vosk_final_result (GstVosk *vosk)
-{
-  const gchar *json_txt = NULL;
-
-  GST_INFO_OBJECT(vosk, "getting final result");
-
-  PROTECT_FROM_LOCALE_BUG_START
-
-  if (G_UNLIKELY(vosk->recognizer == NULL)) {
-    GST_DEBUG_OBJECT(vosk, "no recognizer available");
-    goto end;
-  }
-
-  /* Avoid unnecessary operation if there is no data that have been processed.
-   * We could even raise the threshold as a tenth of second would probably
-   * yield no result either. */
-  if (vosk->processed_size == 0) {
-    GST_DEBUG_OBJECT(vosk, "no data processed");
-    goto end;
-  }
-
-  if (vosk->prev_partial) {
-    g_free (vosk->prev_partial);
-    vosk->prev_partial = NULL;
-  }
-
-  json_txt = vosk_recognizer_final_result (vosk->recognizer);
-  vosk->processed_size = 0;
-
-end:
-
-  PROTECT_FROM_LOCALE_BUG_END
-
-  GST_INFO_OBJECT(vosk, "final results");
-
-  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
-    return NULL;
-
-  return json_txt;
 }
 
 static void
@@ -487,6 +347,86 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
 }
 
 static void
+gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
+{
+  GstMessage *msg;
+  GstStructure *contents;
+  GValue value = G_VALUE_INIT;
+
+  if (!text_results)
+    return;
+
+  contents = gst_structure_new_empty ("vosk");
+
+  g_value_init (&value, G_TYPE_STRING);
+  g_value_set_string (&value, text_results);
+
+  gst_structure_set_value (contents, "current-result", &value);
+  g_value_unset (&value);
+
+  msg = gst_message_new_element (GST_OBJECT (vosk), contents);
+  gst_element_post_message (GST_ELEMENT (vosk), msg);
+}
+
+/*
+ * MUST be called with lock held
+ */
+static const gchar *
+gst_vosk_final_result (GstVosk *vosk)
+{
+  const gchar *json_txt = NULL;
+
+  GST_INFO_OBJECT(vosk, "getting final result");
+
+  PROTECT_FROM_LOCALE_BUG_START
+
+  if (G_UNLIKELY(vosk->recognizer == NULL)) {
+    GST_DEBUG_OBJECT(vosk, "no recognizer available");
+    goto end;
+  }
+
+  /* Avoid unnecessary operation if there is no data that have been processed.
+   * We could even raise the threshold as a tenth of second would probably
+   * yield no result either. */
+  if (vosk->processed_size == 0) {
+    GST_DEBUG_OBJECT(vosk, "no data processed");
+    goto end;
+  }
+
+  if (vosk->prev_partial) {
+    g_free (vosk->prev_partial);
+    vosk->prev_partial = NULL;
+  }
+
+  json_txt = vosk_recognizer_final_result (vosk->recognizer);
+  vosk->processed_size = 0;
+
+end:
+
+  PROTECT_FROM_LOCALE_BUG_END
+
+  GST_INFO_OBJECT(vosk, "final results");
+
+  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
+    return NULL;
+
+  return json_txt;
+}
+
+static void
+gst_vosk_set_num_alternatives(GstVosk *vosk)
+{
+  GST_VOSK_LOCK(vosk);
+
+  if (vosk->recognizer)
+    vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
+  else
+    GST_LOG_OBJECT (vosk, "No recognizer to set num alternatives.");
+
+  GST_VOSK_UNLOCK(vosk);
+}
+
+static void
 gst_vosk_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec)
 {
@@ -520,7 +460,7 @@ gst_vosk_set_property (GObject * object, guint prop_id,
       gst_vosk_set_num_alternatives (vosk);
       break;
 
-    case PROP_PARTIAL_RESULTS:
+    case PROP_PARTIAL_RESULTS_INTERVAL:
       vosk->partial_time_interval=g_value_get_int64(value) * GST_MSECOND;
       break;
 
@@ -547,8 +487,7 @@ gst_vosk_get_property (GObject *object,
       g_value_set_int(prop_value, vosk->alternatives);
       break;
 
-    /* FIXME: This should a function (+ GObject Introspection) */
-    case PROP_RESULT:
+    case PROP_CURRENT_FINAL_RESULTS:
       {
         const gchar *json_txt = NULL;
 
@@ -560,7 +499,7 @@ gst_vosk_get_property (GObject *object,
       }
       break;
 
-    case PROP_PARTIAL_RESULTS:
+    case PROP_PARTIAL_RESULTS_INTERVAL:
       g_value_set_int64(prop_value, vosk->partial_time_interval / GST_MSECOND);
       break;
 
@@ -745,6 +684,60 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
     gst_vosk_partial_result(vosk);
     vosk->last_partial=GST_BUFFER_PTS (buf);
   }
+}
+
+static gint
+gst_vosk_get_rate(GstVosk *vosk)
+{
+  GstStructure *caps_struct;
+  GstCaps *caps;
+  gint rate = 0;
+
+  caps=gst_pad_get_current_caps(vosk->sinkpad);
+  if (caps == NULL) {
+    GST_INFO_OBJECT (vosk, "no capabilities set on sink pad.");
+    return 0;
+  }
+
+  caps_struct = gst_caps_get_structure (caps, 0);
+  if (caps_struct == NULL) {
+    GST_INFO_OBJECT (vosk, "no capabilities structure.");
+    return 0;
+  }
+
+  if (gst_structure_get_int (caps_struct, "rate", &rate) == FALSE) {
+    GST_INFO_OBJECT (vosk, "no rate set in the capabilities");
+    return 0;
+  }
+
+  return rate;
+}
+
+/*
+ * MUST be called with lock held
+ */
+static gboolean
+gst_vosk_recognizer_new (GstVosk *vosk)
+{
+  vosk->rate = gst_vosk_get_rate(vosk);
+  if (vosk->rate <= 0.0) {
+    GST_INFO_OBJECT (vosk, "rate not set yet: no recognizer created.");
+    return FALSE;
+  }
+
+  GST_INFO_OBJECT (vosk, "current rate is %f", vosk->rate);
+
+  if (vosk->model == NULL) {
+    GST_INFO_OBJECT (vosk, "no model provided.");
+    return FALSE;
+  }
+
+  vosk->processed_size = 0;
+
+  GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", vosk->rate);
+  vosk->recognizer = vosk_recognizer_new (vosk->model, vosk->rate);
+  vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
+  return TRUE;
 }
 
 typedef struct {
