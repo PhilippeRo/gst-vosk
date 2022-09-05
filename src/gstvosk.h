@@ -50,6 +50,8 @@ struct _GstVosk
   gint              alternatives;
   gfloat            rate;
 
+  GstClockTime        last_processed_time;
+
   GstClockTime      last_partial;
   gint64            partial_time_interval;
 
@@ -62,7 +64,6 @@ struct _GstVosk
   VoskModel        *model;
   VoskRecognizer   *recognizer;
   gchar            *prev_partial;
-  guint64           processed_size;
 
   GCancellable     *current_operation;
   GCond             wake_stream;

@@ -237,7 +237,6 @@ gst_vosk_init (GstVosk * vosk)
     vosk_set_log_level (-1);
 
   vosk->rate = 0.0;
-  vosk->processed_size = 0;
   vosk->alternatives = DEFAULT_ALTERNATIVE_NUM;
   vosk->model_path = g_strdup(DEFAULT_SPEECH_MODEL);
 
@@ -254,7 +253,6 @@ gst_vosk_reset (GstVosk *vosk)
   if (vosk->recognizer) {
     vosk_recognizer_free (vosk->recognizer);
     vosk->recognizer = NULL;
-    vosk->processed_size = 0;
   }
 
   if (vosk->model != NULL) {
@@ -380,16 +378,8 @@ gst_vosk_final_result (GstVosk *vosk)
 
   PROTECT_FROM_LOCALE_BUG_START
 
-  if (G_UNLIKELY(vosk->recognizer == NULL)) {
+  if (G_UNLIKELY(!vosk->recognizer)) {
     GST_DEBUG_OBJECT(vosk, "no recognizer available");
-    goto end;
-  }
-
-  /* Avoid unnecessary operation if there is no data that have been processed.
-   * We could even raise the threshold as a tenth of second would probably
-   * yield no result either. */
-  if (vosk->processed_size == 0) {
-    GST_DEBUG_OBJECT(vosk, "no data processed");
     goto end;
   }
 
@@ -399,7 +389,6 @@ gst_vosk_final_result (GstVosk *vosk)
   }
 
   json_txt = vosk_recognizer_final_result (vosk->recognizer);
-  vosk->processed_size = 0;
 
 end:
 
@@ -516,10 +505,8 @@ gst_vosk_flush(GstVosk *vosk)
 
   GST_VOSK_LOCK(vosk);
 
-  if (vosk->recognizer) {
+  if (vosk->recognizer)
     vosk_recognizer_reset(vosk->recognizer);
-    vosk->processed_size = 0;
-  }
   else
     GST_DEBUG_OBJECT (vosk, "no recognizer to flush");
 
@@ -593,7 +580,6 @@ gst_vosk_result (GstVosk *vosk)
     return;
 
   gst_vosk_message_new (vosk, json_txt);
-  vosk->processed_size = 0;
 }
 
 static void
@@ -638,14 +624,13 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
     GST_ERROR_OBJECT (vosk, "accept_waveform error");
     return;
   }
-  vosk->processed_size += info.size;
 
   current_time = gst_element_get_current_running_time(GST_ELEMENT(vosk));
-  diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS (buf), current_time);
+  diff_time = GST_CLOCK_DIFF(GST_BUFFER_PTS(buf), current_time);
 
   GST_LOG_OBJECT (vosk, "buffer time=%"GST_TIME_FORMAT" current time=%"GST_TIME_FORMAT" diff=%li " \
                   "(buffer size %lu)",
-                  GST_TIME_ARGS(GST_BUFFER_PTS (buf)),
+                  GST_TIME_ARGS(GST_BUFFER_PTS(buf)),
                   GST_TIME_ARGS(current_time),
                   diff_time,
                   info.size);
@@ -656,17 +641,20 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
    * so 1/100 of a second = number of bytes / 100.
    * It means 5 buffers approx. */
   if (diff_time > (GST_SECOND / 2)) {
-    GST_DEBUG_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up (%lu)",
-                     GST_TIME_ARGS(diff_time),
-                     (vosk->processed_size % (guint64) vosk->rate));
+    GST_DEBUG_OBJECT (vosk, "we are late %"GST_TIME_FORMAT", catching up",
+                     GST_TIME_ARGS(diff_time));
 
-    /* FIXME: this does not always work when the buffer size does not match
-     * the size in bytes of a frame. */
-    if ((vosk->processed_size % (guint64) vosk->rate) >= info.size)
+    /* Check results every half second nevertheless. */
+    diff_time=GST_CLOCK_DIFF(vosk->last_processed_time, GST_BUFFER_PTS(buf));
+    GST_DEBUG_OBJECT (vosk, "%"GST_TIME_FORMAT" elapsed since last processed buffer",
+                     GST_TIME_ARGS(diff_time));
+    if (diff_time < ((GST_SECOND << 1) / 10))
       return;
 
-    GST_INFO_OBJECT (vosk, "forcing result checking (consumed one second of data)");
+    GST_INFO_OBJECT (vosk, "forcing result checking (consumed half a second of data)");
   }
+
+  vosk->last_processed_time=GST_BUFFER_PTS(buf);
 
   if (result == 1) {
     GST_LOG_OBJECT (vosk, "checking result");
@@ -682,7 +670,7 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
   if (vosk->partial_time_interval < diff_time) {
     GST_LOG_OBJECT (vosk, "checking partial result");
     gst_vosk_partial_result(vosk);
-    vosk->last_partial=GST_BUFFER_PTS (buf);
+    vosk->last_partial=GST_BUFFER_PTS(buf);
   }
 }
 
@@ -731,8 +719,6 @@ gst_vosk_recognizer_new (GstVosk *vosk)
     GST_INFO_OBJECT (vosk, "no model provided.");
     return FALSE;
   }
-
-  vosk->processed_size = 0;
 
   GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", vosk->rate);
   vosk->recognizer = vosk_recognizer_new (vosk->model, vosk->rate);
@@ -872,6 +858,8 @@ gst_vosk_chain (GstPad *sinkpad,
       GST_VOSK_UNLOCK(vosk);
       return GST_FLOW_OK;
     }
+
+    vosk->last_processed_time=GST_BUFFER_PTS(buf);
   }
 
   gst_vosk_handle_buffer(vosk, buf);
