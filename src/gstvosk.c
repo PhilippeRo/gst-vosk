@@ -414,14 +414,10 @@ static void
 gst_vosk_cancel_model_loading(GstVosk *vosk)
 {
   GST_VOSK_LOCK(vosk);
-  if (!vosk->current_operation)
-    return;
-
-  g_cancellable_cancel(vosk->current_operation);
-  g_object_unref(vosk->current_operation);
-  vosk->current_operation=NULL;
-
-  g_cond_signal(&vosk->wake_stream);
+  if (vosk->current_operation) {
+    g_cancellable_cancel(vosk->current_operation);
+    g_cond_signal(&vosk->wake_stream);
+  }
   GST_VOSK_UNLOCK(vosk);
 }
 
@@ -874,6 +870,10 @@ gst_vosk_chain (GstPad *sinkpad,
 
     /* Block until the thread finishes or until it is cancelled */
     g_cond_wait(&vosk->wake_stream, &vosk->RecMut);
+
+    g_object_unref(vosk->current_operation);
+    vosk->current_operation=NULL;
+
     GST_INFO_OBJECT (vosk, "woken up, model should be ready");
     if (!vosk->model || !vosk->recognizer) {
       GST_VOSK_UNLOCK(vosk);
