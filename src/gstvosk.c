@@ -756,12 +756,26 @@ typedef struct {
   GCancellable *cancellable;
 } GstVoskThreadData;
 
-static gboolean
-gst_vosk_load_model_real (GstVosk *vosk,
-                          GstVoskThreadData *status)
+static void
+gst_vosk_load_model_async (gpointer thread_data,
+                           gpointer element)
 {
-  gboolean ret = FALSE;
+  GstVoskThreadData *status = thread_data;
+  GstVosk *vosk = GST_VOSK (element);
+  GstMessage *message;
   VoskModel *model;
+
+  /* There can be only one model loading at a time. Even when loading has been
+   * cancelled for one model while it is waiting to be loaded.
+   * In this latter case, wait for it to start, notice it was cancelled and
+   * leave.*/
+
+  /* Thread might have been cancelled while waiting, so check that */
+  if (g_cancellable_is_cancelled (status->cancellable)) {
+    GST_INFO_OBJECT (vosk, "model creation cancelled before even trying.");
+    /* Note: don't use condition, it's not our problem any more */
+    goto clean;
+  }
 
   GST_INFO_OBJECT (vosk, "creating model %s.", status->path);
 
@@ -775,77 +789,43 @@ gst_vosk_load_model_real (GstVosk *vosk,
    * cancelled right after checking cancel status and before setting model.
    * Otherwise, a stale model could remain. */
   if (g_cancellable_is_cancelled (status->cancellable)) {
+    GST_VOSK_UNLOCK(vosk);
+
     GST_INFO_OBJECT (vosk, "model creation cancelled %s.", status->path);
     vosk_model_free (model);
 
-    /* Note: in this case don't use condition, not our problem anymore */
-    goto out_lock;
+    /* Note: don't use condition, not our problem anymore */
+    goto clean;
   }
 
   /* Do this here to make sure the following is still relevant */
   if (!model) {
+    GST_VOSK_UNLOCK(vosk);
+
     GST_ERROR_OBJECT(vosk, "could not create model object for %s.", status->path);
     GST_ELEMENT_ERROR(GST_ELEMENT(vosk),
                       RESOURCE,
                       NOT_FOUND,
                       ("model could not be loaded"),
                       ("an error was encountered while loading model (%s)", status->path));
+
+    GST_STATE_LOCK(vosk);
+    gst_element_abort_state (GST_ELEMENT(vosk));
+    GST_STATE_UNLOCK(vosk);
+
     goto out_condition;
   }
 
-  GST_INFO_OBJECT (vosk, "model ready %s.", status->path);
+  GST_INFO_OBJECT (vosk, "model ready (%s).", status->path);
 
   /* This is the only place where vosk->model can be set and only one thread
-   * at a time can do it. */
+   * at a time can do it. Same for recognizer. */
   vosk->model = model;
   gst_vosk_recognizer_new(vosk);
 
-  /* Note: leave current_operation alone. It is cleaned outside that thread. */
-
-  ret=TRUE;
-
-out_condition:
-
-  /* Wake streaming thread, unless we were cancelled */
-  g_cond_signal(&vosk->wake_stream);
-
-out_lock:
-
   GST_VOSK_UNLOCK(vosk);
-  return ret;
-}
-
-static void
-gst_vosk_load_model_async (gpointer thread_data,
-                           gpointer element)
-{
-  GstVoskThreadData *status = thread_data;
-  GstVosk *vosk = GST_VOSK (element);
-  GstMessage *message;
-
-  /* There can be only one model loading at a time. Even when loading has been
-   * cancelled for one model while it was waiting to be loaded.
-   * In this latter case, wait for it to notice it was cancelled and leave.*/
-
-  /* Thread might have been cancelled while waiting, so check that */
-  if (g_cancellable_is_cancelled (status->cancellable)) {
-    GST_INFO_OBJECT (vosk, "model creation cancelled before even trying.");
-    /* Note: don't use condition, it's not our problem any more */
-    goto clean;
-  }
-
-  if (!gst_vosk_load_model_real (vosk, status)) {
-    /* If the lock can't be taken then there is a state change and what follows
-     * is useless. Otherwise, it's probably an error like a wrong path. */
-    if (GST_STATE_TRYLOCK(vosk)) {
-      gst_element_abort_state (GST_ELEMENT(vosk));
-      GST_STATE_UNLOCK(GST_ELEMENT(vosk));
-    }
-    goto clean;
-  }
 
   GST_INFO_OBJECT (vosk, "async state change successfully completed.");
-
   message = gst_message_new_async_done (GST_OBJECT_CAST (vosk),
                                         GST_CLOCK_TIME_NONE);
   gst_element_post_message (element, message);
@@ -854,6 +834,11 @@ gst_vosk_load_model_async (gpointer thread_data,
   GST_STATE_LOCK (element);
   gst_element_continue_state (element, GST_STATE_CHANGE_SUCCESS);
   GST_STATE_UNLOCK (element);
+
+out_condition:
+
+  /* Wake streaming thread, unless we were cancelled */
+  g_cond_signal(&vosk->wake_stream);
 
 clean:
 
