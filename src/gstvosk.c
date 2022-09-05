@@ -297,36 +297,28 @@ gst_vosk_get_rate(GstVosk *vosk)
 /*
  * MUST be called with lock held
  */
-static VoskRecognizer *
-gst_vosk_recognizer_new (GstVosk *vosk,
-                         VoskModel *model,
-                         gfloat rate)
+static gboolean
+gst_vosk_recognizer_new (GstVosk *vosk)
 {
-  VoskRecognizer *recognizer;
-
-  if (rate <= 0.0)
-    rate = (gfloat) gst_vosk_get_rate(vosk);
-
-  if (rate <= 0.0) {
+  vosk->rate = gst_vosk_get_rate(vosk);
+  if (vosk->rate <= 0.0) {
     GST_INFO_OBJECT (vosk, "rate not set yet: no recognizer created.");
-    return NULL;
+    return FALSE;
   }
 
-  GST_INFO_OBJECT (vosk, "current rate is %f", rate);
+  GST_INFO_OBJECT (vosk, "current rate is %f", vosk->rate);
 
-  if (model == NULL) {
+  if (vosk->model == NULL) {
     GST_INFO_OBJECT (vosk, "no model provided.");
-    return NULL;
+    return FALSE;
   }
 
-  vosk->rate = rate;
   vosk->processed_size = 0;
 
-  GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", rate);
-  recognizer = vosk_recognizer_new (model, rate);
-  vosk_recognizer_set_max_alternatives (recognizer, vosk->alternatives);
-
-  return recognizer;
+  GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", vosk->rate);
+  vosk->recognizer = vosk_recognizer_new (vosk->model, vosk->rate);
+  vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
+  return TRUE;
 }
 
 static void
@@ -582,63 +574,6 @@ gst_vosk_get_property (GObject *object,
   }
 }
 
-static gboolean
-gst_vosk_set_caps (GstVosk *vosk, GstCaps *caps)
-{
-  GstStructure *caps_struct;
-  const gchar *json_txt;
-  gboolean success;
-  GstCaps *outcaps;
-  gchar *caps_str;
-  int rate = 0;
-
-  caps_struct = gst_caps_get_structure (caps, 0);
-  if (gst_structure_get_int (caps_struct, "rate", &rate) == FALSE)
-    return FALSE;
-
-  GST_INFO_OBJECT (vosk, "got rate %i", rate);
-
-  GST_VOSK_LOCK(vosk);
-
-  if (vosk->recognizer) {
-    if (G_UNLIKELY((gfloat) rate == vosk->rate)) {
-      GST_INFO_OBJECT (vosk, "rate has not changed; keeping current recognizer");
-      goto end;
-    }
-
-    GST_INFO_OBJECT (vosk, "rate has changed; updating recognizer.");
-
-    /* Send what we have recognized so far */
-    json_txt = gst_vosk_final_result (vosk);
-    gst_vosk_message_new (vosk, json_txt);
-
-    vosk_recognizer_free (vosk->recognizer);
-  }
-  else if (!vosk->model) {
-    GST_INFO_OBJECT (vosk, "model not yet loaded");
-    goto end;
-  }
-  else
-    GST_INFO_OBJECT (vosk, "no recognizer yet available to set rate ; creating one");
-
-  vosk->recognizer = gst_vosk_recognizer_new (vosk, vosk->model, rate);
-
-end:
-  GST_VOSK_UNLOCK(vosk);
-
-  caps_str = g_strdup_printf ("audio/x-raw,"
-                              "format=S16LE,"
-                              "rate=%i,"
-                              "channels=1", rate);
-  outcaps = gst_caps_from_string (caps_str);
-  g_free (caps_str);
-
-  success = gst_pad_set_caps (vosk->srcpad, outcaps);
-  gst_caps_unref (outcaps);
-
-  return success;
-}
-
 static void
 gst_vosk_flush(GstVosk *vosk)
 {
@@ -669,14 +604,6 @@ gst_vosk_sink_event (GstPad *pad,
                   GST_EVENT_TYPE_NAME (event), event);
 
   switch (GST_EVENT_TYPE (event)) {
-    case GST_EVENT_CAPS:
-    {
-      GstCaps *caps = NULL;
-      GST_DEBUG_OBJECT (vosk, "caps event");
-      gst_event_parse_caps (event, &caps);
-      return gst_vosk_set_caps (vosk, caps);
-    }
-
     case GST_EVENT_FLUSH_START:
       gst_vosk_flush(vosk);
       break;
@@ -871,7 +798,7 @@ gst_vosk_load_model_real (GstVosk *vosk,
   /* This is the only place where vosk->model can be set and only one thread
    * at a time can do it. */
   vosk->model = model;
-  vosk->recognizer = gst_vosk_recognizer_new (vosk, model, 0.0);
+  gst_vosk_recognizer_new(vosk);
 
   /* Note: leave current_operation alone. It is cleaned outside that thread. */
 
