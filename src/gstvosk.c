@@ -50,6 +50,7 @@ enum
   PROP_SPEECH_MODEL,
   PROP_ALTERNATIVES,
   PROP_CURRENT_FINAL_RESULTS,
+  PROP_CURRENT_RESULTS,
   PROP_PARTIAL_RESULTS_INTERVAL,
 };
 
@@ -200,6 +201,10 @@ gst_vosk_class_init (GstVoskClass * klass)
       g_param_spec_string ("current-final-results", _("Get recognizer's current final results"), _("Force the recognizer to return final results"),
           NULL, G_PARAM_READABLE));
 
+  g_object_class_install_property (gobject_class, PROP_CURRENT_RESULTS,
+      g_param_spec_string ("current-results", _("Get recognizer's current results"), _("Force the recognizer to return results"),
+          NULL, G_PARAM_READABLE));
+
   g_object_class_install_property (gobject_class, PROP_PARTIAL_RESULTS_INTERVAL,
       g_param_spec_int64 ("partial-results-interval", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results"),
           -1,G_MAXINT64, 0, G_PARAM_READWRITE));
@@ -315,7 +320,9 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
       break;
 
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      /* This must be before GstElement's change_state default function. */
+      /* This must be before GstElement's change_state default function.
+       * When going into the READY state, it waits for the streaming thread
+       * to return. */
       gst_vosk_cancel_model_loading(vosk);
 
     default:
@@ -413,28 +420,6 @@ gst_vosk_set_property (GObject * object, guint prop_id,
   }
 }
 
-static void
-gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
-{
-  GstMessage *msg;
-  GstStructure *contents;
-  GValue value = G_VALUE_INIT;
-
-  if (!text_results)
-    return;
-
-  contents = gst_structure_new_empty ("vosk");
-
-  g_value_init (&value, G_TYPE_STRING);
-  g_value_set_string (&value, text_results);
-
-  gst_structure_set_value (contents, "current-result", &value);
-  g_value_unset (&value);
-
-  msg = gst_message_new_element (GST_OBJECT (vosk), contents);
-  gst_element_post_message (GST_ELEMENT (vosk), msg);
-}
-
 /*
  * MUST be called with lock held
  */
@@ -445,26 +430,52 @@ gst_vosk_final_result (GstVosk *vosk)
 
   GST_INFO_OBJECT(vosk, "getting final result");
 
-  PROTECT_FROM_LOCALE_BUG_START
-
   if (G_UNLIKELY(!vosk->recognizer)) {
     GST_DEBUG_OBJECT(vosk, "no recognizer available");
-    goto end;
+    return NULL;
   }
+
+  PROTECT_FROM_LOCALE_BUG_START
+
+  json_txt = vosk_recognizer_final_result (vosk->recognizer);
+
+  PROTECT_FROM_LOCALE_BUG_END
 
   if (vosk->prev_partial) {
     g_free (vosk->prev_partial);
     vosk->prev_partial = NULL;
   }
 
-  json_txt = vosk_recognizer_final_result (vosk->recognizer);
+  GST_INFO_OBJECT(vosk, "final results");
 
-end:
+  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
+    return NULL;
+
+  return json_txt;
+}
+
+static const gchar *
+gst_vosk_result (GstVosk *vosk)
+{
+  const char *json_txt;
+
+  if (G_UNLIKELY(!vosk->recognizer)) {
+    GST_DEBUG_OBJECT(vosk, "no recognizer available");
+    return NULL;
+  }
+
+  PROTECT_FROM_LOCALE_BUG_START
+
+  json_txt = vosk_recognizer_result (vosk->recognizer);
 
   PROTECT_FROM_LOCALE_BUG_END
 
-  GST_INFO_OBJECT(vosk, "final results");
+  if (vosk->prev_partial) {
+    g_free (vosk->prev_partial);
+    vosk->prev_partial = NULL;
+  }
 
+  /* Don't send message if empty */
   if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
     return NULL;
 
@@ -489,15 +500,15 @@ gst_vosk_get_property (GObject *object,
       break;
 
     case PROP_CURRENT_FINAL_RESULTS:
-      {
-        const gchar *json_txt = NULL;
+      GST_VOSK_LOCK(vosk);
+      g_value_set_string (prop_value, gst_vosk_final_result(vosk));
+      GST_VOSK_UNLOCK(vosk);
+      break;
 
-        /* Note : we are certain that json_txt is valid while we have the lock */
-        GST_VOSK_LOCK(vosk);
-        json_txt = gst_vosk_final_result(vosk);
-        g_value_set_string (prop_value, json_txt);
-        GST_VOSK_UNLOCK(vosk);
-      }
+    case PROP_CURRENT_RESULTS:
+      GST_VOSK_LOCK(vosk);
+      g_value_set_string (prop_value, gst_vosk_result(vosk));
+      GST_VOSK_UNLOCK(vosk);
       break;
 
     case PROP_PARTIAL_RESULTS_INTERVAL:
@@ -508,6 +519,38 @@ gst_vosk_get_property (GObject *object,
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
+}
+
+static void
+gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
+{
+  GstMessage *msg;
+  GstStructure *contents;
+  GValue value = G_VALUE_INIT;
+
+  if (!text_results)
+    return;
+
+  contents = gst_structure_new_empty ("vosk");
+
+  g_value_init (&value, G_TYPE_STRING);
+  g_value_set_string (&value, text_results);
+
+  gst_structure_set_value (contents, "current-result", &value);
+  g_value_unset (&value);
+
+  msg = gst_message_new_element (GST_OBJECT (vosk), contents);
+  gst_element_post_message (GST_ELEMENT (vosk), msg);
+}
+
+inline static void
+gst_vosk_final_result_msg (GstVosk *vosk)
+{
+  const gchar *json_txt = NULL;
+
+  json_txt = gst_vosk_final_result(vosk);
+  if (json_txt)
+    gst_vosk_message_new (vosk, json_txt);
 }
 
 static void
@@ -543,21 +586,16 @@ gst_vosk_sink_event (GstPad *pad,
       break;
 
     case GST_EVENT_EOS:
-    {
-      const gchar *json_txt;
-
-      /* Cancel any ongoing loading */
+      /* Cancel any ongoing model loading */
       gst_vosk_cancel_model_loading(vosk);
 
       /* Wait for the stream to complete */
       GST_PAD_STREAM_LOCK(vosk->sinkpad);
-      json_txt = gst_vosk_final_result (vosk);
-      gst_vosk_message_new (vosk, json_txt);
+      gst_vosk_final_result_msg(vosk);
       GST_PAD_STREAM_UNLOCK(vosk->sinkpad);
 
       GST_DEBUG_OBJECT (vosk, "EOS stop event");
       break;
-    }
 
     default:
       break;
@@ -570,28 +608,14 @@ gst_vosk_sink_event (GstPad *pad,
  * The following functions are only called by gst_vosk_chain().
  * Which means that lock is held.
  */
-
-static void
-gst_vosk_result (GstVosk *vosk)
+inline static void
+gst_vosk_result_msg (GstVosk *vosk)
 {
-  const char *json_txt;
+  const gchar *json_txt;
 
-  PROTECT_FROM_LOCALE_BUG_START
-
-  json_txt = vosk_recognizer_result (vosk->recognizer);
-
-  PROTECT_FROM_LOCALE_BUG_END
-
-  if (vosk->prev_partial) {
-    g_free (vosk->prev_partial);
-    vosk->prev_partial = NULL;
-  }
-
-  /* Don't send message if empty */
-  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
-    return;
-
-  gst_vosk_message_new (vosk, json_txt);
+  json_txt=gst_vosk_result(vosk);
+  if (json_txt)
+    gst_vosk_message_new (vosk, json_txt);
 }
 
 static void
@@ -670,7 +694,7 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
 
   if (result == 1) {
     GST_LOG_OBJECT (vosk, "checking result");
-    gst_vosk_result(vosk);
+    gst_vosk_result_msg(vosk);
     vosk->last_partial=GST_BUFFER_PTS (buf);
     return;
   }
@@ -756,7 +780,7 @@ gst_vosk_load_model_async (gpointer thread_data,
 
   /* Thread might have been cancelled while waiting, so check that */
   if (g_cancellable_is_cancelled (status->cancellable)) {
-    GST_INFO_OBJECT (vosk, "model creation cancelled before even trying.");
+    GST_INFO_OBJECT (vosk, "model creation cancelled without even trying (%s).", status->path);
     /* Note: don't use condition, it's not our problem any more */
     goto clean;
   }
@@ -775,7 +799,7 @@ gst_vosk_load_model_async (gpointer thread_data,
   if (g_cancellable_is_cancelled (status->cancellable)) {
     GST_VOSK_UNLOCK(vosk);
 
-    GST_INFO_OBJECT (vosk, "model creation cancelled %s.", status->path);
+    GST_INFO_OBJECT (vosk, "model creation cancelled (%s).", status->path);
     vosk_model_free (model);
 
     /* Note: don't use condition, not our problem anymore */
