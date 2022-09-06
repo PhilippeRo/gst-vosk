@@ -189,19 +189,19 @@ gst_vosk_class_init (GstVoskClass * klass)
   gobject_class->finalize = gst_vosk_finalize;
 
   g_object_class_install_property (gobject_class, PROP_SPEECH_MODEL,
-      g_param_spec_string ("speech-model", "Speech Model", _("Location (path) of the speech model."),
+      g_param_spec_string ("speech-model", _("Speech Model"), _("Location (path) of the speech model"),
           DEFAULT_SPEECH_MODEL, G_PARAM_READWRITE|GST_PARAM_MUTABLE_READY));
 
   g_object_class_install_property (gobject_class, PROP_ALTERNATIVES,
-      g_param_spec_int ("alternatives", "Alternative Number", _("Number of alternative results returned."),
+      g_param_spec_int ("alternatives", _("Alternative Number"), _("Number of alternative results returned"),
           0, 100, DEFAULT_ALTERNATIVE_NUM, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_CURRENT_FINAL_RESULTS,
-      g_param_spec_string ("current-final-results", "Get recognizer's current final results", _("Force the recognizer to return final results."),
+      g_param_spec_string ("current-final-results", _("Get recognizer's current final results"), _("Force the recognizer to return final results"),
           NULL, G_PARAM_READABLE));
 
   g_object_class_install_property (gobject_class, PROP_PARTIAL_RESULTS_INTERVAL,
-      g_param_spec_int64 ("partial-results-interval", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results."),
+      g_param_spec_int64 ("partial-results-interval", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results"),
           -1,G_MAXINT64, 0, G_PARAM_READWRITE));
 
   gst_element_class_set_details_simple(gstelement_class,
@@ -345,6 +345,75 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
 }
 
 static void
+gst_vosk_set_num_alternatives(GstVosk *vosk)
+{
+  GST_VOSK_LOCK(vosk);
+
+  if (vosk->recognizer)
+    vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
+  else
+    GST_LOG_OBJECT (vosk, "No recognizer to set num alternatives.");
+
+  GST_VOSK_UNLOCK(vosk);
+}
+
+static void
+gst_vosk_set_model_path (GstVosk *vosk,
+                         const gchar *model_path)
+{
+  GstState state;
+
+  /* This property can only be changed in the READY state */
+  GST_OBJECT_LOCK(vosk);
+  state = GST_STATE(vosk);
+  if (state != GST_STATE_READY && state != GST_STATE_NULL) {
+    GST_INFO_OBJECT (vosk, "Changing the `speech-model' property can only "
+                           "be done in NULL or READY state");
+    GST_OBJECT_UNLOCK(vosk);
+    return;
+  }
+  GST_OBJECT_UNLOCK(vosk);
+
+  GST_INFO_OBJECT (vosk, "new path for model %s", model_path);
+  if(!g_strcmp0 (model_path, vosk->model_path))
+    return;
+
+  if (vosk->model_path)
+    g_free (vosk->model_path);
+
+  vosk->model_path = g_strdup (model_path);
+}
+
+static void
+gst_vosk_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstVosk *vosk = GST_VOSK (object);
+
+  switch (prop_id) {
+    case PROP_SPEECH_MODEL:
+      gst_vosk_set_model_path(vosk, g_value_get_string (value));
+      break;
+
+    case PROP_ALTERNATIVES:
+      if (vosk->alternatives == g_value_get_int (value))
+        return;
+
+      vosk->alternatives = g_value_get_int(value);
+      gst_vosk_set_num_alternatives (vosk);
+      break;
+
+    case PROP_PARTIAL_RESULTS_INTERVAL:
+      vosk->partial_time_interval=g_value_get_int64(value) * GST_MSECOND;
+      break;
+
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
 gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
 {
   GstMessage *msg;
@@ -400,63 +469,6 @@ end:
     return NULL;
 
   return json_txt;
-}
-
-static void
-gst_vosk_set_num_alternatives(GstVosk *vosk)
-{
-  GST_VOSK_LOCK(vosk);
-
-  if (vosk->recognizer)
-    vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
-  else
-    GST_LOG_OBJECT (vosk, "No recognizer to set num alternatives.");
-
-  GST_VOSK_UNLOCK(vosk);
-}
-
-static void
-gst_vosk_set_property (GObject * object, guint prop_id,
-    const GValue * value, GParamSpec * pspec)
-{
-  GstVosk *vosk = GST_VOSK (object);
-
-  switch (prop_id) {
-    case PROP_SPEECH_MODEL:
-    {
-      const gchar *model_path;
-
-      model_path = g_value_get_string (value);
-      GST_INFO_OBJECT (vosk, "new path for model %s", model_path);
-
-      if(!g_strcmp0 (model_path, vosk->model_path))
-        return;
-
-      if (vosk->model_path)
-        g_free (vosk->model_path);
-
-      vosk->model_path = g_strdup (model_path);
-
-      /* This property can only be changed in the READY state */
-      break;
-    }
-
-    case PROP_ALTERNATIVES:
-      if (vosk->alternatives == g_value_get_int (value))
-        return;
-
-      vosk->alternatives = g_value_get_int(value);
-      gst_vosk_set_num_alternatives (vosk);
-      break;
-
-    case PROP_PARTIAL_RESULTS_INTERVAL:
-      vosk->partial_time_interval=g_value_get_int64(value) * GST_MSECOND;
-      break;
-
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-      break;
-  }
 }
 
 static void
@@ -651,7 +663,7 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
     if (diff_time < ((GST_SECOND << 1) / 10))
       return;
 
-    GST_INFO_OBJECT (vosk, "forcing result checking (consumed half a second of data)");
+    GST_INFO_OBJECT (vosk, "forcing result checking");
   }
 
   vosk->last_processed_time=GST_BUFFER_PTS(buf);
@@ -701,9 +713,6 @@ gst_vosk_get_rate(GstVosk *vosk)
   return rate;
 }
 
-/*
- * MUST be called with lock held
- */
 static gboolean
 gst_vosk_recognizer_new (GstVosk *vosk)
 {
