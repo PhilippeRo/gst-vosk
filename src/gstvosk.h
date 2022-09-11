@@ -68,7 +68,6 @@ struct _GstVosk
   gchar            *prev_partial;
 
   GCancellable     *current_operation;
-  GCond             wake_stream;
 };
 
 struct _GstVoskClass
