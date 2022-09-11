@@ -48,9 +48,11 @@ struct _GstVosk
 
   gchar            *model_path;
   gint              alternatives;
+  gboolean          use_signals;
+
   gfloat            rate;
 
-  GstClockTime        last_processed_time;
+  GstClockTime      last_processed_time;
 
   GstClockTime      last_partial;
   gint64            partial_time_interval;

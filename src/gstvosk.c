@@ -41,12 +41,16 @@ GST_DEBUG_CATEGORY_STATIC (gst_vosk_debug);
 
 enum
 {
+  RESULT,
   LAST_SIGNAL
 };
+
+static guint signals[LAST_SIGNAL] = {0};
 
 enum
 {
   PROP_0,
+  PROP_USE_SIGNALS,
   PROP_SPEECH_MODEL,
   PROP_ALTERNATIVES,
   PROP_CURRENT_FINAL_RESULTS,
@@ -189,6 +193,10 @@ gst_vosk_class_init (GstVoskClass * klass)
   gobject_class->get_property = gst_vosk_get_property;
   gobject_class->finalize = gst_vosk_finalize;
 
+  g_object_class_install_property (gobject_class, PROP_USE_SIGNALS,
+      g_param_spec_boolean ("use-signals", _("Emit GObject signals"), _("Use GObject signals instead of Gstreamer messages to pass the results of recognition"),
+          FALSE, G_PARAM_READWRITE));
+
   g_object_class_install_property (gobject_class, PROP_SPEECH_MODEL,
       g_param_spec_string ("speech-model", _("Speech Model"), _("Location (path) of the speech model"),
           DEFAULT_SPEECH_MODEL, G_PARAM_READWRITE|GST_PARAM_MUTABLE_READY));
@@ -208,6 +216,16 @@ gst_vosk_class_init (GstVoskClass * klass)
   g_object_class_install_property (gobject_class, PROP_PARTIAL_RESULTS_INTERVAL,
       g_param_spec_int64 ("partial-results-interval", _("Minimum time interval between partial results"), _("Set the minimum time interval between partial results (in milliseconds). Set -1 to disable partial results"),
           -1,G_MAXINT64, 0, G_PARAM_READWRITE));
+
+  signals[RESULT] =
+    g_signal_new ("result",
+                  G_OBJECT_CLASS_TYPE (gobject_class),
+                  G_SIGNAL_RUN_LAST | G_SIGNAL_NO_RECURSE,
+                  0, NULL, NULL,
+                  g_cclosure_marshal_VOID__STRING,
+                  G_TYPE_NONE,
+                  1,
+                  G_TYPE_STRING);
 
   gst_element_class_set_details_simple(gstelement_class,
     "vosk",
@@ -322,7 +340,7 @@ gst_vosk_change_state (GstElement *element, GstStateChange transition)
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       /* This must be before GstElement's change_state default function.
        * When going into the READY state, it waits for the streaming thread
-       * to return. */
+       * to return and if we are loading a model we wait for it to end. */
       gst_vosk_cancel_model_loading(vosk);
 
     default:
@@ -398,6 +416,10 @@ gst_vosk_set_property (GObject * object, guint prop_id,
   GstVosk *vosk = GST_VOSK (object);
 
   switch (prop_id) {
+    case PROP_USE_SIGNALS:
+      vosk->use_signals=g_value_get_boolean (value);
+      break;
+
     case PROP_SPEECH_MODEL:
       gst_vosk_set_model_path(vosk, g_value_get_string (value));
       break;
@@ -491,6 +513,10 @@ gst_vosk_get_property (GObject *object,
   GstVosk *vosk = GST_VOSK (object);
 
   switch (prop_id) {
+    case PROP_USE_SIGNALS:
+      g_value_set_boolean (prop_value, vosk->use_signals);
+      break;
+
     case PROP_SPEECH_MODEL:
       g_value_set_string (prop_value, vosk->model_path);
       break;
@@ -524,23 +550,27 @@ gst_vosk_get_property (GObject *object,
 static void
 gst_vosk_message_new (GstVosk *vosk, const gchar *text_results)
 {
-  GstMessage *msg;
-  GstStructure *contents;
-  GValue value = G_VALUE_INIT;
-
   if (!text_results)
     return;
 
-  contents = gst_structure_new_empty ("vosk");
+  if (vosk->use_signals)
+    g_signal_emit(vosk, signals[RESULT], 0, text_results);
+  else {
+    GstMessage *msg;
+    GstStructure *contents;
+    GValue value = G_VALUE_INIT;
 
-  g_value_init (&value, G_TYPE_STRING);
-  g_value_set_string (&value, text_results);
+    contents = gst_structure_new_empty ("vosk");
 
-  gst_structure_set_value (contents, "current-result", &value);
-  g_value_unset (&value);
+    g_value_init (&value, G_TYPE_STRING);
+    g_value_set_string (&value, text_results);
 
-  msg = gst_message_new_element (GST_OBJECT (vosk), contents);
-  gst_element_post_message (GST_ELEMENT (vosk), msg);
+    gst_structure_set_value (contents, "current-result", &value);
+    g_value_unset (&value);
+
+    msg = gst_message_new_element (GST_OBJECT (vosk), contents);
+    gst_element_post_message (GST_ELEMENT (vosk), msg);
+  }
 }
 
 inline static void
