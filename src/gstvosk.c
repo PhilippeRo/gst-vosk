@@ -635,7 +635,9 @@ gst_vosk_final_result (GstVosk *vosk)
 
   GST_INFO_OBJECT(vosk, "final results");
 
-  if (!json_txt || !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT))
+  if (!json_txt ||
+      !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT) ||
+      !strcmp(json_txt, VOSK_EMPTY_TEXT_RESULT_ALT))
     return NULL;
 
   return json_txt;
