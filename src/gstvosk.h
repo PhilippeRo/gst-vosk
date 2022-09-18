@@ -63,7 +63,6 @@ struct _GstVosk
 
   /* Access to the following members should be done
    * with GST_VOSK_LOCK held */
-  VoskModel        *model;
   VoskRecognizer   *recognizer;
   gchar            *prev_partial;
 

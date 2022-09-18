@@ -278,11 +278,6 @@ gst_vosk_reset (GstVosk *vosk)
     vosk->recognizer = NULL;
   }
 
-  if (vosk->model != NULL) {
-    vosk_model_free (vosk->model);
-    vosk->model = NULL;
-  }
-
   if (vosk->prev_partial) {
     g_free (vosk->prev_partial);
     vosk->prev_partial = NULL;
@@ -332,7 +327,7 @@ gst_vosk_get_rate(GstVosk *vosk)
 }
 
 static gboolean
-gst_vosk_recognizer_new (GstVosk *vosk)
+gst_vosk_recognizer_new (GstVosk *vosk, VoskModel *model)
 {
   vosk->rate = gst_vosk_get_rate(vosk);
   if (vosk->rate <= 0.0) {
@@ -342,13 +337,13 @@ gst_vosk_recognizer_new (GstVosk *vosk)
 
   GST_INFO_OBJECT (vosk, "current rate is %f", vosk->rate);
 
-  if (vosk->model == NULL) {
+  if (model == NULL) {
     GST_INFO_OBJECT (vosk, "no model provided.");
     return FALSE;
   }
 
   GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", vosk->rate);
-  vosk->recognizer = vosk_recognizer_new (vosk->model, vosk->rate);
+  vosk->recognizer = vosk_recognizer_new (model, vosk->rate);
   vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
   return TRUE;
 }
@@ -424,10 +419,11 @@ gst_vosk_load_model_async (gpointer thread_data,
 
   GST_INFO_OBJECT (vosk, "model ready (%s).", status->path);
 
-  /* This is the only place where vosk->model can be set and only one thread
-   * at a time can do it. Same for recognizer. */
-  vosk->model = model;
-  gst_vosk_recognizer_new(vosk);
+  /* This is the only place where vosk->recognizer can be set and only one
+   * thread at a time can do it. */
+  gst_vosk_recognizer_new(vosk, model);
+  /* Unreference the model (it does not destroy it) */
+  vosk_model_free (model);
 
   GST_VOSK_UNLOCK(vosk);
 
