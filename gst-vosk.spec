@@ -1,5 +1,5 @@
 Name:   gst-vosk
-Version:  0.2.0
+Version:  0.3.1
 Release:  1%{?dist}
 Summary:  Gstreamer plugin for VOSK voice recognition engine
 
@@ -34,5 +34,5 @@ Gstreamer plugin for VOSK voice recognition engine.
 %{_libdir}/libvosk.so
 
 %changelog
-* Sun Jul 31 2022 Philippe Rouquier <bonfire-app@wanadoo.fr> 0.1.0-1
-- Initial version of the package
+* Sun Jul 31 2022 Philippe Rouquier <bonfire-app@wanadoo.fr> 0.3.1-1
+- update to lastest release: https://github.com/PhilippeRo/gst-vosk/releases/tag/0.3.1
